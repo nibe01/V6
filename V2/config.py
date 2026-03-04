@@ -28,10 +28,23 @@ class IBConfig:
     host: str = "127.0.0.1"
     port: int = 7497
     client_id: int = 11  # Scanner uses this
+    monitor_client_id: int = 10  # Broker Monitor uses this
     trader_client_id: int = 12  # Trader uses this
     # Historical only: we will use delayed / historical bars; no streaming market data required.
     use_rth: bool = True  # Regular Trading Hours only (True recommended)
     connection_check_interval_seconds: float = 30.0  # Health-check interval
+
+
+@dataclass(frozen=True)
+class MonitorConfig:
+    heartbeat_interval_seconds: float = 30.0
+    position_update_interval_seconds: float = 60.0
+    account_update_interval_seconds: float = 300.0
+    end_of_day_report: bool = True
+    # Minuten vor Marktöffnung, ab wann der Monitor Prozesse starten darf
+    pre_market_start_minutes: float = 2.0
+    # Minuten nach Marktschluss, nach denen Prozesse gestoppt werden
+    post_market_stop_minutes: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -175,6 +188,7 @@ def get_config():
     return {
         "scanner": ScannerConfig(),
         "ib": IBConfig(),
+        "monitor": MonitorConfig(),
         "strategy": StrategyConfig(rules=rules),
         "trading": TradingConfig(),
         "edge_scanner": EdgeScannerConfig(

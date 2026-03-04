@@ -21,6 +21,8 @@ class AccountInfo:
     """Account information from IB."""
     net_liquidation: float
     total_cash_value: float
+    usd_cash_value: float
+    total_cash_all_currencies: float
     buying_power: float
     excess_liquidity: float
     maintenance_margin: float
@@ -52,6 +54,15 @@ class AccountChecker:
     ) -> Optional[AccountInfo]:
         import time
 
+        def _to_float(raw) -> float:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                try:
+                    return float(str(raw).replace(",", ""))
+                except Exception:
+                    return 0.0
+
         if not force_refresh and self._cached_info:
             age = time.time() - self._cache_timestamp
             if age < self.cache_seconds:
@@ -73,18 +84,47 @@ class AccountChecker:
                 logger.warning("No account data received from IB")
                 return None
 
-            data = {item.tag: item.value for item in account_values}
+            by_tag_currency = {
+                (item.tag, getattr(item, "currency", "")): item.value
+                for item in account_values
+            }
 
-            net_liquidation = float(data.get("NetLiquidation", 0))
-            total_cash = float(data.get("TotalCashValue", 0))
-            buying_power = float(data.get("BuyingPower", 0))
-            excess_liquidity = float(data.get("ExcessLiquidity", 0))
-            maintenance_margin = float(data.get("MaintMarginReq", 0))
-            currency = data.get("Currency", "USD")
+            def value_for(tag: str, currency: str) -> float:
+                return _to_float(by_tag_currency.get((tag, currency), 0.0))
+
+            net_liquidation = value_for("NetLiquidation", "USD")
+            if net_liquidation <= 0:
+                net_liquidation = value_for("NetLiquidation", "BASE")
+
+            total_cash_all = value_for("TotalCashValue", "BASE")
+            if total_cash_all <= 0:
+                total_cash_all = value_for("TotalCashValue", "USD")
+
+            usd_cash = value_for("CashBalance", "USD")
+            if usd_cash == 0:
+                usd_cash = value_for("TotalCashValue", "USD")
+            if usd_cash == 0 and total_cash_all > 0:
+                usd_cash = total_cash_all
+
+            buying_power = value_for("BuyingPower", "USD")
+            if buying_power <= 0:
+                buying_power = value_for("BuyingPower", "BASE")
+
+            excess_liquidity = value_for("ExcessLiquidity", "USD")
+            if excess_liquidity <= 0:
+                excess_liquidity = value_for("ExcessLiquidity", "BASE")
+
+            maintenance_margin = value_for("MaintMarginReq", "USD")
+            if maintenance_margin <= 0:
+                maintenance_margin = value_for("MaintMarginReq", "BASE")
+
+            currency = "USD"
 
             account_info = AccountInfo(
                 net_liquidation=net_liquidation,
-                total_cash_value=total_cash,
+                total_cash_value=usd_cash,
+                usd_cash_value=usd_cash,
+                total_cash_all_currencies=total_cash_all,
                 buying_power=buying_power,
                 excess_liquidity=excess_liquidity,
                 maintenance_margin=maintenance_margin,
@@ -96,9 +136,17 @@ class AccountChecker:
 
             logger.debug(
                 f"Account Info: Balance=${net_liquidation:.2f}, "
-                f"Cash=${total_cash:.2f}, "
+                f"USD Cash=${usd_cash:.2f}, "
+                f"Total Cash (all currencies)=${total_cash_all:.2f}, "
                 f"Buying Power=${buying_power:.2f}"
             )
+
+            if usd_cash < 0:
+                logger.warning(
+                    "USD cash is negative: $%.2f (total cash all currencies: $%.2f)",
+                    usd_cash,
+                    total_cash_all,
+                )
 
             return account_info
 
@@ -121,11 +169,11 @@ class AccountChecker:
 
         required_capital = trade_amount * (1 + safety_margin)
 
-        if account_info.total_cash_value < required_capital:
+        if account_info.usd_cash_value < required_capital:
             return (
                 False,
-                "Insufficient cash: "
-                f"${account_info.total_cash_value:.2f} available, "
+                "Insufficient USD cash: "
+                f"${account_info.usd_cash_value:.2f} available, "
                 f"${required_capital:.2f} required "
                 f"(including {safety_margin * 100:.0f}% margin)",
             )
@@ -150,7 +198,7 @@ class AccountChecker:
         logger.debug(
             f"Can afford {symbol} trade: "
             f"${trade_amount:.2f} required, "
-            f"${account_info.total_cash_value:.2f} available"
+            f"${account_info.usd_cash_value:.2f} USD available"
         )
 
         return True, "OK"
@@ -167,7 +215,7 @@ class AccountChecker:
             return 0
 
         max_usd = account_info.net_liquidation * max_percentage
-        max_usd = min(max_usd, account_info.total_cash_value * 0.9)
+        max_usd = min(max_usd, account_info.usd_cash_value * 0.9)
 
         max_qty = int(max_usd / price_per_share)
 
@@ -189,7 +237,8 @@ class AccountChecker:
         logger.info("ACCOUNT STATUS")
         logger.info("=" * 60)
         logger.info(f"Net Liquidation:    ${account_info.net_liquidation:12,.2f}")
-        logger.info(f"Cash Available:     ${account_info.total_cash_value:12,.2f}")
+        logger.info(f"USD Cash Available: ${account_info.usd_cash_value:12,.2f}")
+        logger.info(f"Total Cash (all):   ${account_info.total_cash_all_currencies:12,.2f}")
         logger.info(f"Buying Power:       ${account_info.buying_power:12,.2f}")
         logger.info(f"Excess Liquidity:   ${account_info.excess_liquidity:12,.2f}")
         logger.info(f"Maintenance Margin: ${account_info.maintenance_margin:12,.2f}")

@@ -23,6 +23,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from utils.logging_utils import setup_logging
+from utils.market_schedule import MarketSchedule
 from utils.data_utils import load_extended_symbols
 from utils.paths import OUTPUT_DIR
 from config import validate_and_get_config
@@ -430,8 +431,19 @@ def main():
     
     i = 0
     blocks_processed = 0
+    market_schedule = MarketSchedule()
     try:
         while True:
+            if not market_schedule.is_market_open():
+                wait_seconds = min(market_schedule.seconds_until_open(), 60.0)
+                logger.info(
+                    "Markt geschlossen (%s) – Scanner pausiert für %.0fs",
+                    market_schedule.get_status_string(),
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+                continue
+
             if not ib_manager.check_connection():
                 logger.warning("Connection lost, attempting reconnect...")
                 try:

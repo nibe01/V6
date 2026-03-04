@@ -1,7 +1,8 @@
 # V2 Trading System
 
-V2 ist ein automatisiertes Trading-System mit zwei laufenden Prozessen:
+V2 ist ein automatisiertes Trading-System mit drei Prozessen:
 
+- `monitor/broker_monitor.py` läuft 24/7, hält die IB-Verbindung und steuert Scanner/Trader.
 - `scanner/scanner_edge.py` erzeugt Signale aus einem mehrstufigen Edge-Filter.
 - `trader/trader_live.py` verarbeitet diese Signale und führt Trades mit TP/SL-Risikologik aus.
 
@@ -10,6 +11,10 @@ V2 ist ein automatisiertes Trading-System mit zwei laufenden Prozessen:
 ```text
 V2/
 ├── config.py                     # Zentrale Dataclass-Konfiguration
+├── monitor/
+│   ├── broker_monitor.py         # 24/7 Broker-Monitor (Haupt-Einstiegspunkt)
+│   ├── position_tracker.py       # Positions- und P&L-Tracking
+│   └── process_manager.py        # Subprocess-Verwaltung für Scanner+Trader
 ├── scanner/
 │   ├── scanner_edge.py           # Signal-Pipeline (Edge Scanner)
 │   ├── edge_filters.py           # Ebenen 0-5 Filterlogik
@@ -20,6 +25,7 @@ V2/
 │   └── order_verification.py     # Order-/Bracket-Checks
 ├── utils/
 │   ├── ib_connection.py          # Robustes Connect/Reconnect zu IB
+│   ├── market_schedule.py        # NYSE Marktzeiten (neu)
 │   ├── rate_limiter.py           # API-Limitschutz
 │   ├── account_checker.py        # Kontostand/Buying-Power Checks
 │   ├── position_reconciliation.py# State vs. IB Reconciliation
@@ -32,12 +38,14 @@ V2/
 
 ## Laufzeitfluss
 
-1. Scanner lädt Symbole aus `data/extended_symbols.csv`.
-2. Pro Symbol wird die 6-Ebenen-Pipeline ausgewertet.
-3. Passende Kandidaten werden als JSONL in `output/signals.jsonl` geschrieben.
-4. Trader liest die Queue inkrementell (Offset-basiert, ohne Datei-Leeren).
-5. Trader setzt Entry, wartet Fill ab, setzt TP/SL, schreibt State in `state/processed_signals.json`.
-6. Reconciliation und Schutzroutinen halten State, Positionen und Exit-Orders konsistent.
+```text
+00:00–09:28 ET  broker_monitor läuft, Scanner+Trader pausiert
+09:30 ET        broker_monitor startet scanner_edge + trader_live
+09:30–16:00 ET  Normaler Handelsbetrieb
+16:00 ET        broker_monitor stoppt scanner_edge + trader_live
+16:00–16:05 ET  End-of-Day Report wird erstellt
+16:05–23:59 ET  broker_monitor läuft, überwacht offene Positionen
+```
 
 ## Scanner-Logik (Edge Pipeline)
 
@@ -95,16 +103,17 @@ Hinweis: Scanner- und Trader-Client-ID müssen unterschiedlich sein.
 
 Arbeitsverzeichnis ist der Projektordner `V2/`.
 
-Scanner starten:
+Empfohlen (Monitor steuert alles automatisch):
 
 ```bash
-python3 -m scanner.scanner_edge
+python3 -m monitor.broker_monitor
 ```
 
-Trader starten (zweites Terminal):
+Alternativ manuell (Entwicklung/Debugging):
 
 ```bash
-python3 -m trader.trader_live
+python3 -m scanner.scanner_edge   # Terminal 1
+python3 -m trader.trader_live     # Terminal 2
 ```
 
 ## Statistik-Logs (Scanner)

@@ -1,0 +1,10 @@
+{
+  "last_heartbeat": "",
+  "market_open": false,
+  "scanner_running": false,
+  "trader_running": false,
+  "ib_connected": false,
+  "open_positions": 0,
+  "today_trades": 0,
+  "today_pnl_usd": 0.0
+}

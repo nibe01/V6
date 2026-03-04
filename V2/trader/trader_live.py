@@ -40,6 +40,7 @@ from utils.trade_status import (
     is_manual_status,
 )
 from utils.trading_context import TradingContext
+from utils.market_schedule import MarketSchedule
 
 
 
@@ -2061,6 +2062,7 @@ def main():
     # Letzte Connection-Check Zeit
     last_connection_check = time.time()
     connection_check_interval = ib_cfg.connection_check_interval_seconds
+    market_schedule = MarketSchedule()
 
     try:
         loop_counter = 0
@@ -2068,6 +2070,16 @@ def main():
         failed_entry_block_until: Dict[str, float] = {}
 
         while True:
+            if not market_schedule.is_market_open():
+                wait_seconds = min(market_schedule.seconds_until_open(), 60.0)
+                context.logger.info(
+                    "Markt geschlossen (%s) – Trader pausiert für %.0fs",
+                    market_schedule.get_status_string(),
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+                continue
+
             loop_counter += 1
 
             # NEU: Periodischer Connection-Check (alle 30 Sekunden)

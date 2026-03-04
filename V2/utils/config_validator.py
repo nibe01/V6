@@ -284,6 +284,70 @@ class ConfigValidator:
                 )
             )
 
+        # monitor_client_id
+        if not hasattr(cfg, "monitor_client_id"):
+            self.errors.append(
+                ValidationError(
+                    section="ib",
+                    field="monitor_client_id",
+                    value=None,
+                    reason="Missing monitor_client_id",
+                    severity="ERROR",
+                )
+            )
+        elif not isinstance(cfg.monitor_client_id, int):
+            self.errors.append(
+                ValidationError(
+                    section="ib",
+                    field="monitor_client_id",
+                    value=cfg.monitor_client_id,
+                    reason=f"Must be int, got {type(cfg.monitor_client_id).__name__}",
+                    severity="ERROR",
+                )
+            )
+        elif cfg.monitor_client_id <= 0:
+            self.errors.append(
+                ValidationError(
+                    section="ib",
+                    field="monitor_client_id",
+                    value=cfg.monitor_client_id,
+                    reason="Must be a positive integer (> 0)",
+                    severity="ERROR",
+                )
+            )
+
+        if (
+            hasattr(cfg, "monitor_client_id")
+            and isinstance(cfg.monitor_client_id, int)
+            and isinstance(cfg.client_id, int)
+            and cfg.monitor_client_id == cfg.client_id
+        ):
+            self.errors.append(
+                ValidationError(
+                    section="ib",
+                    field="monitor_client_id / client_id",
+                    value=f"{cfg.monitor_client_id} / {cfg.client_id}",
+                    reason="Monitor and Scanner must have different client_ids",
+                    severity="ERROR",
+                )
+            )
+
+        if (
+            hasattr(cfg, "monitor_client_id")
+            and isinstance(cfg.monitor_client_id, int)
+            and isinstance(cfg.trader_client_id, int)
+            and cfg.monitor_client_id == cfg.trader_client_id
+        ):
+            self.errors.append(
+                ValidationError(
+                    section="ib",
+                    field="monitor_client_id / trader_client_id",
+                    value=f"{cfg.monitor_client_id} / {cfg.trader_client_id}",
+                    reason="Monitor and Trader must have different client_ids",
+                    severity="ERROR",
+                )
+            )
+
         # connection_check_interval_seconds
         if not isinstance(cfg.connection_check_interval_seconds, (int, float)):
             self.errors.append(
@@ -1056,15 +1120,25 @@ class ConfigValidator:
         if not ib_cfg or not trading_cfg:
             return
 
-        # Critical: scanner and trader must not share client_id
-        if ib_cfg.client_id == ib_cfg.trader_client_id:
+        client_ids = [
+            getattr(ib_cfg, "monitor_client_id", None),
+            getattr(ib_cfg, "client_id", None),
+            getattr(ib_cfg, "trader_client_id", None),
+        ]
+        valid_client_ids = [cid for cid in client_ids if isinstance(cid, int)]
+
+        # Critical: monitor/scanner/trader must all use unique client IDs
+        if len(valid_client_ids) == 3 and len(set(valid_client_ids)) != 3:
             self.errors.append(
                 ValidationError(
                     section="ib",
-                    field="client_id / trader_client_id",
-                    value=f"{ib_cfg.client_id} / {ib_cfg.trader_client_id}",
+                    field="monitor_client_id / client_id / trader_client_id",
+                    value=(
+                        f"{getattr(ib_cfg, 'monitor_client_id', None)} / "
+                        f"{ib_cfg.client_id} / {ib_cfg.trader_client_id}"
+                    ),
                     reason=(
-                        "Scanner and Trader must have different client_ids. "
+                        "Monitor, Scanner and Trader must have different client_ids. "
                         "IB will reject duplicate connections."
                     ),
                     severity="ERROR",
