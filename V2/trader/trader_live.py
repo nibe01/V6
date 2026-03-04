@@ -44,6 +44,9 @@ from utils.market_schedule import MarketSchedule
 
 
 
+POSITION_MISSING_CONFIRMATION_CHECKS = 3
+
+
 def _calc_qty(
     context: TradingContext,
     account_balance: float,
@@ -435,8 +438,26 @@ def _update_position_status(
         symbol = trade_data.get("symbol")
         status = trade_data.get("status")
 
+        if is_bot_filled_status(status) and symbol in current_positions:
+            if trade_data.pop("missing_position_checks", None) is not None:
+                changed = True
+            continue
+
         # Wenn Status filled aber keine Position mehr -> closed
         if is_bot_filled_status(status) and symbol not in current_positions:
+            missing_checks = int(trade_data.get("missing_position_checks", 0)) + 1
+            trade_data["missing_position_checks"] = missing_checks
+            changed = True
+
+            if missing_checks < POSITION_MISSING_CONFIRMATION_CHECKS:
+                context.logger.debug(
+                    "%s: position missing check %s/%s - waiting before close confirmation",
+                    symbol,
+                    missing_checks,
+                    POSITION_MISSING_CONFIRMATION_CHECKS,
+                )
+                continue
+
             entry_price = trade_data.get("fill_price") or trade_data.get(
                 "entry_price", 0
             )
@@ -465,6 +486,7 @@ def _update_position_status(
 
             processed[key]["status"] = BOT_STATUS_CLOSED
             processed[key]["closed_at"] = datetime.now(timezone.utc).isoformat()
+            processed[key].pop("missing_position_checks", None)
             context.logger.position(f"CLOSED: {symbol}")
             context.cooldown_manager.clear_cooldown(symbol)
             context.cooldown_manager.clear_cooldowns_by_reason("insufficient_cash")

@@ -18,6 +18,9 @@ from utils.trade_status import (
 )
 
 
+POSITION_MISSING_CONFIRMATION_CHECKS = 3
+
+
 class PositionTracker:
     def __init__(
         self,
@@ -131,7 +134,25 @@ class PositionTracker:
             symbol = trade_data.get("symbol")
             status = trade_data.get("status")
 
+            if is_bot_filled_status(status) and symbol in current_positions:
+                if trade_data.pop("missing_position_checks", None) is not None:
+                    changed = True
+                continue
+
             if is_bot_filled_status(status) and symbol not in current_positions:
+                missing_checks = int(trade_data.get("missing_position_checks", 0)) + 1
+                trade_data["missing_position_checks"] = missing_checks
+                changed = True
+
+                if missing_checks < POSITION_MISSING_CONFIRMATION_CHECKS:
+                    self.logger.debug(
+                        "%s: position missing check %s/%s - waiting before close confirmation",
+                        symbol,
+                        missing_checks,
+                        POSITION_MISSING_CONFIRMATION_CHECKS,
+                    )
+                    continue
+
                 entry_price = trade_data.get("fill_price") or trade_data.get("entry_price", 0)
                 quantity = trade_data.get("quantity", 0)
 
@@ -156,6 +177,7 @@ class PositionTracker:
 
                 processed[key]["status"] = BOT_STATUS_CLOSED
                 processed[key]["closed_at"] = datetime.now(timezone.utc).isoformat()
+                processed[key].pop("missing_position_checks", None)
                 self.logger.position("CLOSED: %s", symbol)
                 self.cooldown_manager.clear_cooldown(symbol)
                 self.cooldown_manager.clear_cooldowns_by_reason("insufficient_cash")

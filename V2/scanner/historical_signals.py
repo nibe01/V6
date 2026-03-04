@@ -99,7 +99,14 @@ def fetch_bars_df(
         formatDate=1,
         keepUpToDate=False,
     )
-    return util.df(bars)
+    bars_df = util.df(bars)
+    if bars_df is None:
+        # Keep scanner call-sites safe: they expect a DataFrame with `.empty`.
+        import pandas as pd
+
+        return pd.DataFrame()
+
+    return bars_df
 
 
 def evaluate_rules_from_bars(

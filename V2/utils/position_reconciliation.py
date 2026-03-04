@@ -24,6 +24,9 @@ from utils.trade_status import (
 logger = get_logger(__name__)
 
 
+RECON_MISSING_IN_IB_CONFIRMATION_CHECKS = 3
+
+
 @dataclass
 class PositionDiscrepancy:
     """Describes a mismatch between bot state and IB."""
@@ -85,6 +88,22 @@ class PositionReconciliator:
 
         # Step 3: Bot positions missing in IB
         for symbol, bot_data in bot_positions.items():
+            if symbol in ib_positions:
+                bot_data.pop("missing_in_ib_checks", None)
+                continue
+
+            missing_checks = int(bot_data.get("missing_in_ib_checks", 0)) + 1
+            bot_data["missing_in_ib_checks"] = missing_checks
+
+            if missing_checks < RECON_MISSING_IN_IB_CONFIRMATION_CHECKS:
+                logger.debug(
+                    "%s: reconciliation missing-in-IB check %s/%s - waiting before auto-close",
+                    symbol,
+                    missing_checks,
+                    RECON_MISSING_IN_IB_CONFIRMATION_CHECKS,
+                )
+                continue
+
             if symbol not in ib_positions:
                 discrepancy = PositionDiscrepancy(
                     symbol=symbol,
@@ -227,25 +246,58 @@ class PositionReconciliator:
                 trade_data["closed_at"] = now
 
     def _get_ib_positions_dict(self, ib: IB) -> Dict[str, dict]:
-        """Fetch IB positions as a dict."""
+        """Fetch IB positions as a dict.
+
+        Uses `ib.positions()` as primary source for existence/quantity because it is
+        typically more reliable for fast state checks than portfolio snapshots.
+        Portfolio values are merged in when available.
+        """
         positions: Dict[str, dict] = {}
 
-        for item in ib.portfolio():
-            symbol = item.contract.symbol
-            qty = int(item.position)
+        # Primary truth for open positions
+        for pos in ib.positions():
+            symbol = getattr(getattr(pos, "contract", None), "symbol", None)
+            qty = int(getattr(pos, "position", 0) or 0)
+            if not symbol or qty == 0:
+                continue
 
-            if qty != 0:
-                positions[symbol] = {
+            positions[symbol] = {
+                "symbol": symbol,
+                "quantity": abs(qty),
+                "avg_cost": 0.0,
+                "market_value": 0.0,
+                "unrealized_pnl": 0.0,
+            }
+
+        # Enrich with valuation data from portfolio when available
+        for item in ib.portfolio():
+            symbol = getattr(getattr(item, "contract", None), "symbol", None)
+            qty = int(getattr(item, "position", 0) or 0)
+            if not symbol or qty == 0:
+                continue
+
+            existing = positions.get(symbol)
+            if existing is None:
+                existing = {
                     "symbol": symbol,
                     "quantity": abs(qty),
-                    "avg_cost": float(item.averageCost) if item.averageCost else 0.0,
-                    "market_value": float(item.marketValue)
-                    if item.marketValue
-                    else 0.0,
-                    "unrealized_pnl": float(item.unrealizedPNL)
-                    if item.unrealizedPNL
-                    else 0.0,
+                    "avg_cost": 0.0,
+                    "market_value": 0.0,
+                    "unrealized_pnl": 0.0,
                 }
+                positions[symbol] = existing
+
+            existing["avg_cost"] = (
+                float(item.averageCost) if getattr(item, "averageCost", None) else existing["avg_cost"]
+            )
+            existing["market_value"] = (
+                float(item.marketValue) if getattr(item, "marketValue", None) else existing["market_value"]
+            )
+            existing["unrealized_pnl"] = (
+                float(item.unrealizedPNL)
+                if getattr(item, "unrealizedPNL", None)
+                else existing["unrealized_pnl"]
+            )
 
         return positions
 
@@ -389,6 +441,7 @@ class PositionReconciliator:
                 trade_data["status"] = BOT_STATUS_CLOSED
                 trade_data["closed_at"] = datetime.now(timezone.utc).isoformat()
                 trade_data["close_reason"] = reason
+                trade_data.pop("missing_in_ib_checks", None)
                 logger.position(f"CLOSED: {symbol} (Reason: {reason})")
                 return True
         return False
