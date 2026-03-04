@@ -22,6 +22,7 @@ class LogCategory(Enum):
     ORDERS = "orders"       # Order-Aktivität (Send/Fill/Cancel)
     POSITIONS = "positions" # Position-Updates (Open/Close)
     PERFORMANCE = "performance"  # Performance-Metriken
+    SCANNER = "scanner"    # Scanner-Laufzeit/Filter-Events
     ERRORS = "errors"       # Errors & Warnings
     DEBUG = "debug"         # Detailliertes Debug-Log
 
@@ -101,6 +102,11 @@ class MultiLogger:
         self.info(f"Logs Directory: {LOGS_DIR}")
         self.info("=" * 80)
 
+    def _is_scanner_logger(self) -> bool:
+        """Detect scanner-related logger names for scanner-only file logging."""
+        lowered = self.name.lower()
+        return lowered == "scanner" or lowered.startswith("scanner") or ".scanner" in lowered
+
     # ========== MAIN LOG (Standard-Logs) ==========
 
     def info(self, msg: str, *args):
@@ -108,6 +114,8 @@ class MultiLogger:
         if args:
             msg = msg % args
         self.loggers[LogCategory.MAIN].info(msg)
+        if self._is_scanner_logger():
+            self.loggers[LogCategory.SCANNER].info(msg)
         if self.debug_mode:
             self.loggers[LogCategory.DEBUG].info(msg)
 
@@ -117,6 +125,8 @@ class MultiLogger:
             msg = msg % args
         self.loggers[LogCategory.MAIN].warning(msg)
         self.loggers[LogCategory.ERRORS].warning(msg)
+        if self._is_scanner_logger():
+            self.loggers[LogCategory.SCANNER].warning(msg)
         if self.debug_mode:
             self.loggers[LogCategory.DEBUG].warning(msg)
 
@@ -126,6 +136,8 @@ class MultiLogger:
             msg = msg % args
         self.loggers[LogCategory.MAIN].error(msg, exc_info=exc_info)
         self.loggers[LogCategory.ERRORS].error(msg, exc_info=exc_info)
+        if self._is_scanner_logger():
+            self.loggers[LogCategory.SCANNER].error(msg, exc_info=exc_info)
         if self.debug_mode:
             self.loggers[LogCategory.DEBUG].error(msg, exc_info=exc_info)
 
@@ -135,6 +147,8 @@ class MultiLogger:
             if args:
                 msg = msg % args
             self.loggers[LogCategory.DEBUG].debug(msg)
+            if self._is_scanner_logger():
+                self.loggers[LogCategory.SCANNER].debug(msg)
 
     # ========== SPECIALIZED LOGS ==========
 
@@ -164,6 +178,8 @@ class MultiLogger:
             msg = msg % args
         self.loggers[LogCategory.SIGNALS].info(msg)
         self.loggers[LogCategory.MAIN].info(f"[SIGNAL] {msg}")
+        if self._is_scanner_logger():
+            self.loggers[LogCategory.SCANNER].info(f"[SIGNAL] {msg}")
         if self.debug_mode:
             self.loggers[LogCategory.DEBUG].info(f"[SIGNAL] {msg}")
 
@@ -211,6 +227,8 @@ class MultiLogger:
             msg = msg % args
         self.loggers[LogCategory.PERFORMANCE].info(msg)
         self.loggers[LogCategory.MAIN].info(f"[PERF] {msg}")
+        if self._is_scanner_logger():
+            self.loggers[LogCategory.SCANNER].info(f"[PERF] {msg}")
         if self.debug_mode:
             self.loggers[LogCategory.DEBUG].info(f"[PERF] {msg}")
 
