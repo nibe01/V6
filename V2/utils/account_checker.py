@@ -85,20 +85,47 @@ class AccountChecker:
                 return None
 
             by_tag_currency = {
-                (item.tag, getattr(item, "currency", "")): item.value
+                (str(item.tag), str(getattr(item, "currency", "") or "")): item.value
                 for item in account_values
             }
+
+            by_tag: dict[str, list[tuple[str, float]]] = {}
+            for item in account_values:
+                tag = str(item.tag)
+                currency = str(getattr(item, "currency", "") or "")
+                by_tag.setdefault(tag, []).append((currency, _to_float(item.value)))
 
             def value_for(tag: str, currency: str) -> float:
                 return _to_float(by_tag_currency.get((tag, currency), 0.0))
 
-            net_liquidation = value_for("NetLiquidation", "USD")
-            if net_liquidation <= 0:
-                net_liquidation = value_for("NetLiquidation", "BASE")
+            def value_for_tag_with_priority(
+                tag: str,
+                preferred_currencies: tuple[str, ...],
+            ) -> float:
+                entries = by_tag.get(tag, [])
+                if not entries:
+                    return 0.0
 
-            total_cash_all = value_for("TotalCashValue", "BASE")
-            if total_cash_all <= 0:
-                total_cash_all = value_for("TotalCashValue", "USD")
+                for curr in preferred_currencies:
+                    for entry_currency, entry_value in entries:
+                        if entry_currency == curr:
+                            return entry_value
+
+                for _, entry_value in entries:
+                    if entry_value != 0.0:
+                        return entry_value
+
+                return entries[0][1]
+
+            net_liquidation = value_for_tag_with_priority(
+                "NetLiquidation",
+                ("BASE", "USD"),
+            )
+
+            total_cash_all = value_for_tag_with_priority(
+                "TotalCashValue",
+                ("BASE", "USD"),
+            )
 
             usd_cash = value_for("CashBalance", "USD")
             if usd_cash == 0:
@@ -106,17 +133,20 @@ class AccountChecker:
             if usd_cash == 0 and total_cash_all > 0:
                 usd_cash = total_cash_all
 
-            buying_power = value_for("BuyingPower", "USD")
-            if buying_power <= 0:
-                buying_power = value_for("BuyingPower", "BASE")
+            buying_power = value_for_tag_with_priority(
+                "BuyingPower",
+                ("BASE", "USD"),
+            )
 
-            excess_liquidity = value_for("ExcessLiquidity", "USD")
-            if excess_liquidity <= 0:
-                excess_liquidity = value_for("ExcessLiquidity", "BASE")
+            excess_liquidity = value_for_tag_with_priority(
+                "ExcessLiquidity",
+                ("BASE", "USD"),
+            )
 
-            maintenance_margin = value_for("MaintMarginReq", "USD")
-            if maintenance_margin <= 0:
-                maintenance_margin = value_for("MaintMarginReq", "BASE")
+            maintenance_margin = value_for_tag_with_priority(
+                "MaintMarginReq",
+                ("BASE", "USD"),
+            )
 
             currency = "USD"
 
