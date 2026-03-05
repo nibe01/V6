@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import glob
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -15,6 +16,7 @@ from utils.state_retry import (
     save_state_with_retry,
     update_state_atomically,
 )
+from utils.state_utils import file_lock
 from trader.order_verification import get_order_status_summary
 from utils.daily_loss_counter import DailyLossCounter
 from utils.ib_connection import IBConnectionManager, ConnectionConfig
@@ -112,6 +114,41 @@ def _has_position(ib: IB, symbol: str) -> bool:
     for p in ib.positions():
         if p.contract.symbol == symbol and p.position != 0:
             return True
+    return False
+
+
+def _parse_iso_to_utc(ts: str) -> Optional[datetime]:
+    """Parse ISO timestamp into UTC datetime (best effort)."""
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _should_prune_state_entry(trade_data: dict, cutoff: datetime) -> bool:
+    """Return True if state entry is old enough and safe to prune."""
+    status = str(trade_data.get("status", "")).strip().lower()
+    if status not in {"closed", "rejected", "manual_closed"}:
+        return False
+
+    ts_candidates = (
+        trade_data.get("closed_at"),
+        trade_data.get("processed_at"),
+        trade_data.get("signal_timestamp"),
+        trade_data.get("first_seen_at"),
+    )
+
+    for ts in ts_candidates:
+        parsed = _parse_iso_to_utc(str(ts)) if ts else None
+        if parsed is not None:
+            return parsed < cutoff
+
+    # If no parseable timestamp exists, keep the entry to avoid accidental data loss.
     return False
 
 
@@ -232,6 +269,51 @@ def _count_open_positions(ib: IB) -> int:
         if p.position != 0:
             count += 1
     return count
+
+
+def _as_utc_iso(ts: datetime) -> str:
+    """Normalize a datetime to UTC ISO format."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _infer_position_opened_at_from_ib(ib: IB, symbol: str) -> Optional[str]:
+    """
+    Best-effort inference for when a currently open position was opened.
+
+    Uses the latest BUY fill timestamp seen in IB trades for the symbol.
+    """
+    latest_buy_fill_time: Optional[datetime] = None
+
+    for trade in ib.trades():
+        contract = getattr(trade, "contract", None)
+        if not contract or getattr(contract, "symbol", None) != symbol:
+            continue
+
+        order = getattr(trade, "order", None)
+        action = str(getattr(order, "action", "")).upper()
+        if action != "BUY":
+            continue
+
+        fills = getattr(trade, "fills", None) or []
+        for fill in fills:
+            execution = getattr(fill, "execution", None)
+            if execution is None:
+                continue
+
+            shares = int(getattr(execution, "shares", 0) or 0)
+            exec_time = getattr(execution, "time", None)
+            if shares <= 0 or not isinstance(exec_time, datetime):
+                continue
+
+            if latest_buy_fill_time is None or exec_time > latest_buy_fill_time:
+                latest_buy_fill_time = exec_time
+
+    if latest_buy_fill_time is None:
+        return None
+
+    return _as_utc_iso(latest_buy_fill_time)
 
 
 def _seed_startup_positions_and_cooldowns(
@@ -413,7 +495,14 @@ def _update_position_status(
         # Dieser Code ist nur noch fuer Backwards-Compatibility mit alten States
         if current_status == BOT_STATUS_SUBMITTED and ib_status == "Filled":
             processed[key]["status"] = BOT_STATUS_FILLED
-            processed[key]["filled_at"] = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            processed[key]["filled_at"] = now_iso
+            if not processed[key].get("opened_at"):
+                processed[key]["opened_at"] = (
+                    processed[key].get("signal_timestamp")
+                    or processed[key].get("processed_at")
+                    or now_iso
+                )
             context.logger.position(
                 f"FILLED: {info['symbol']} | Order: {order_id}"
             )
@@ -1514,6 +1603,7 @@ def _build_recovered_bot_trade_from_ib(
         return None
 
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    opened_at = _infer_position_opened_at_from_ib(ib, symbol) or now
     state_key = f"recovered_{symbol}_{now}"
     is_filled = order_status == "Filled" and (filled_qty > 0 or ib_qty > 0)
 
@@ -1529,6 +1619,7 @@ def _build_recovered_bot_trade_from_ib(
         "quantity": filled_qty if filled_qty > 0 else ib_qty,
         "status": BOT_STATUS_FILLED if is_filled else BOT_STATUS_SUBMITTED,
         "filled_at": now if is_filled else None,
+        "opened_at": opened_at,
         "note": "recovered_from_ib_untracked_position",
     }
 
@@ -1856,6 +1947,7 @@ def main():
 
     cfg = validate_and_get_config()
     ib_cfg = cfg["ib"]
+    monitor_cfg = cfg["monitor"]
     tr_cfg = cfg["trading"]
 
     signals_path = Path(OUTPUT_DIR) / "signals.jsonl"
@@ -1875,6 +1967,14 @@ def main():
         1 * 1024 * 1024,
         int(getattr(tr_cfg, "signal_queue_warning_bytes", 50 * 1024 * 1024)),
     )
+    signal_queue_rotate_bytes = max(
+        5 * 1024 * 1024,
+        int(getattr(tr_cfg, "signal_queue_rotate_bytes", 250 * 1024 * 1024)),
+    )
+    signal_queue_retention_files = max(
+        1,
+        int(getattr(tr_cfg, "signal_queue_retention_files", 30)),
+    )
     signal_queue_warning_interval_seconds = max(
         60,
         int(
@@ -1884,6 +1984,14 @@ def main():
                 900,
             )
         ),
+    )
+    processed_state_retention_days = max(
+        1,
+        int(getattr(tr_cfg, "processed_state_retention_days", 45)),
+    )
+    processed_state_cleanup_interval_seconds = max(
+        60,
+        int(getattr(tr_cfg, "processed_state_cleanup_interval_seconds", 3600)),
     )
 
     def rotate_archive_if_needed() -> None:
@@ -1909,6 +2017,7 @@ def main():
     signal_offset = 0
     signal_partial_line = ""
     last_signal_queue_warning_at = 0.0
+    last_state_cleanup_at = 0.0
 
     def monitor_signal_queue_size() -> None:
         """
@@ -1991,6 +2100,100 @@ def main():
 
         return [line for line in complete_lines if line.strip()]
 
+    def compact_signal_queue_if_safe() -> None:
+        """
+        Compact consumed queue file when trader is fully caught up.
+
+        Safety rule: only rotate if no unread bytes remain (offset == file size)
+        and no partial line is buffered.
+        """
+        nonlocal signal_offset, signal_partial_line
+
+        if not signals_path.exists() or signal_partial_line:
+            return
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        rotated_path = signals_path.with_name(f"signals_queue_{timestamp}.jsonl")
+
+        try:
+            with file_lock(signals_path, timeout=10.0, mode="exclusive"):
+                if not signals_path.exists():
+                    return
+
+                file_size = signals_path.stat().st_size
+                if file_size < signal_queue_rotate_bytes:
+                    return
+
+                # Re-check under lock to avoid TOCTOU races with scanner writes.
+                if signal_offset < file_size:
+                    return
+
+                signals_path.rename(rotated_path)
+                context.logger.info(
+                    "Compacted consumed signal queue: %s -> %s",
+                    signals_path,
+                    rotated_path,
+                )
+                signal_offset = 0
+                signal_partial_line = ""
+        except Exception as e:
+            context.logger.warning("Could not compact signals queue: %s", e)
+            return
+
+        try:
+            rotated_files = sorted(
+                glob.glob(str(signals_path.with_name("signals_queue_*.jsonl"))),
+                key=lambda p: Path(p).stat().st_mtime,
+                reverse=True,
+            )
+        except Exception as e:
+            context.logger.warning("Could not list rotated signal queues: %s", e)
+            return
+
+        for old_path in rotated_files[signal_queue_retention_files:]:
+            try:
+                Path(old_path).unlink(missing_ok=True)
+                context.logger.info("Removed old rotated signal queue: %s", old_path)
+            except Exception as e:
+                context.logger.warning("Could not remove old rotated queue %s: %s", old_path, e)
+
+    def prune_processed_state_if_due(force: bool = False) -> None:
+        """Prune old closed/rejected/manual_closed entries from processed state."""
+        nonlocal processed, last_state_cleanup_at
+
+        now_ts = time.time()
+        if not force and (now_ts - last_state_cleanup_at) < processed_state_cleanup_interval_seconds:
+            return
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=processed_state_retention_days)
+
+        def _prune(state: Dict[str, dict]) -> Dict[str, dict]:
+            pruned = {}
+            removed_count = 0
+            for k, v in state.items():
+                if isinstance(v, dict) and _should_prune_state_entry(v, cutoff):
+                    removed_count += 1
+                    continue
+                pruned[k] = v
+
+            if removed_count:
+                context.logger.info(
+                    "State retention cleanup: removed %s old entries (retention=%s days)",
+                    removed_count,
+                    processed_state_retention_days,
+                )
+            return pruned
+
+        updated = update_state_atomically(
+            processed_path,
+            _prune,
+            max_retries=5,
+        )
+
+        if updated:
+            processed = load_state_with_retry(processed_path, max_retries=2)
+            last_state_cleanup_at = now_ts
+
     processed: Dict[str, dict] = load_state_with_retry(
         processed_path,
         max_retries=5,
@@ -2060,6 +2263,7 @@ def main():
         processed_path=processed_path,
         reconciliator=reconciliator,
     )
+    prune_processed_state_if_due(force=True)
 
     # Log Bot-Positionen
     bot_positions = _count_bot_open_positions(processed)
@@ -2085,6 +2289,8 @@ def main():
     last_connection_check = time.time()
     connection_check_interval = ib_cfg.connection_check_interval_seconds
     market_schedule = MarketSchedule()
+    pre_market_start_minutes = max(0.0, float(monitor_cfg.pre_market_start_minutes))
+    post_market_stop_minutes = max(0.0, float(monitor_cfg.post_market_stop_minutes))
 
     try:
         loop_counter = 0
@@ -2092,10 +2298,19 @@ def main():
         failed_entry_block_until: Dict[str, float] = {}
 
         while True:
-            if not market_schedule.is_market_open():
-                wait_seconds = min(market_schedule.seconds_until_open(), 60.0)
+            if not market_schedule.is_active_trading_window(
+                pre_market_start_minutes=pre_market_start_minutes,
+                post_market_stop_minutes=post_market_stop_minutes,
+            ):
+                wait_seconds = min(
+                    market_schedule.seconds_until_active_window(
+                        pre_market_start_minutes=pre_market_start_minutes,
+                        post_market_stop_minutes=post_market_stop_minutes,
+                    ),
+                    60.0,
+                )
                 context.logger.info(
-                    "Markt geschlossen (%s) – Trader pausiert für %.0fs",
+                    "Außerhalb Aktivitätsfenster (%s) – Trader pausiert für %.0fs",
                     market_schedule.get_status_string(),
                     wait_seconds,
                 )
@@ -2168,6 +2383,10 @@ def main():
 
             if loop_counter % 100 == 0:
                 monitor_signal_queue_size()
+                compact_signal_queue_if_safe()
+
+            if loop_counter % 30 == 0:
+                prune_processed_state_if_due(force=False)
 
             # Position Reconciliation (alle 100 Loops = ~100 Sekunden)
             if loop_counter % 100 == 0:
@@ -2361,9 +2580,11 @@ def main():
                             now = datetime.now(timezone.utc).isoformat(
                                 timespec="microseconds"
                             )
+                            opened_at = _infer_position_opened_at_from_ib(ib, symbol) or now
                             entry = state.get(manual_key)
                             if isinstance(entry, dict):
                                 entry["last_seen_at"] = now
+                                entry.setdefault("opened_at", opened_at)
                                 state[manual_key] = entry
                                 return state
 
@@ -2372,6 +2593,7 @@ def main():
                                 "processed_at": now,
                                 "first_seen_at": now,
                                 "last_seen_at": now,
+                                "opened_at": opened_at,
                                 "status": BOT_STATUS_MANUAL,
                                 "note": "detected from IB positions",
                             }
@@ -2471,6 +2693,7 @@ def main():
 
                 # Atomic update to avoid race conditions with scanner
                 def add_trade(state):
+                    opened_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
                     state[key] = {
                         "symbol": symbol,
                         "signal_timestamp": sig["now_utc"],
@@ -2482,7 +2705,8 @@ def main():
                         "fill_price": order_ids.get("fill_price", price),
                         "quantity": order_ids.get("quantity", 0),
                         "status": BOT_STATUS_FILLED,
-                        "filled_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                        "filled_at": opened_at,
+                        "opened_at": opened_at,
                     }
                     return state
 
@@ -2509,6 +2733,8 @@ def main():
                         "Could not archive signals file lines: %s",
                         e,
                     )
+
+            compact_signal_queue_if_safe()
 
             time.sleep(1)
 

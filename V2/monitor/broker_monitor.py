@@ -10,7 +10,7 @@ Verantwortlichkeiten:
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import validate_and_get_config
@@ -20,21 +20,11 @@ from utils.account_checker import AccountChecker
 from utils.daily_loss_counter import DailyLossCounter
 from utils.ib_connection import ConnectionConfig, IBConnectionManager
 from utils.logging_utils import setup_logging
-from utils.market_schedule import ET, MARKET_CLOSE, MarketSchedule
+from utils.market_schedule import ET, MarketSchedule
 from utils.paths import PROJECT_ROOT, STATE_DIR
 from utils.state_retry import load_state_with_retry
 from utils.state_utils import save_state
 from utils.symbol_cooldown import SymbolCooldownManager
-
-
-def _is_beyond_post_market_stop_window(schedule: MarketSchedule, minutes: float) -> bool:
-    now = datetime.now(ET)
-    today = now.date()
-    if not schedule.is_trading_day(today):
-        return True
-    close_dt = datetime.combine(today, MARKET_CLOSE, tzinfo=ET)
-    stop_after = close_dt + timedelta(minutes=max(0.0, minutes))
-    return now >= stop_after
 
 
 def _build_monitor_state(
@@ -137,6 +127,8 @@ def main() -> None:
     heartbeat_interval = max(5.0, float(monitor_cfg.heartbeat_interval_seconds))
     position_interval = max(5.0, float(monitor_cfg.position_update_interval_seconds))
     account_interval = max(10.0, float(monitor_cfg.account_update_interval_seconds))
+    pre_market_start_minutes = max(0.0, float(monitor_cfg.pre_market_start_minutes))
+    post_market_stop_minutes = max(0.0, float(monitor_cfg.post_market_stop_minutes))
 
     counted_sl_orders: set = set()
     last_position_update = 0.0
@@ -162,6 +154,10 @@ def main() -> None:
                     ib = ib_manager.ensure_connected()
 
                 market_open = market_schedule.is_market_open()
+                process_window_active = market_schedule.is_active_trading_window(
+                    pre_market_start_minutes=pre_market_start_minutes,
+                    post_market_stop_minutes=post_market_stop_minutes,
+                )
                 today_et = datetime.now(ET).date().isoformat()
                 process_status = process_manager.get_status()
 
@@ -171,32 +167,29 @@ def main() -> None:
                     process_manager.start_trader()
                     scanner_started_for_session = True
 
-                if market_open and not scanner_started_for_session:
+                if process_window_active and not scanner_started_for_session:
                     process_manager.start_scanner()
                     process_manager.start_trader()
                     scanner_started_for_session = True
 
                 if market_schedule.just_closed(tolerance_seconds=max(90.0, heartbeat_interval + 5.0)):
-                    logger.info("Marktschluss erkannt (%s), stoppe Scanner+Trader", market_schedule.get_status_string())
-                    process_manager.stop_all()
-                    scanner_started_for_session = False
-
                     if bool(monitor_cfg.end_of_day_report) and eod_done_for_day != today_et:
                         processed_for_report = load_state_with_retry(processed_path, max_retries=3, retry_delay=0.3)
                         report = position_tracker.generate_daily_report(processed_for_report)
                         logger.performance(report)
                         eod_done_for_day = today_et
 
-                if not market_open and _is_beyond_post_market_stop_window(
-                    market_schedule,
-                    float(monitor_cfg.post_market_stop_minutes),
-                ):
+                if not process_window_active:
                     if process_manager.get_status().get("scanner_running") or process_manager.get_status().get("trader_running"):
-                        logger.info("Post-Market-Stopfenster erreicht, stoppe Scanner+Trader")
+                        logger.info(
+                            "Außerhalb des Aktivitätsfensters (pre=%s min, post=%s min), stoppe Scanner+Trader",
+                            pre_market_start_minutes,
+                            post_market_stop_minutes,
+                        )
                         process_manager.stop_all()
                         scanner_started_for_session = False
 
-                if market_open:
+                if process_window_active:
                     process_manager.ensure_running()
 
                 now_ts = time.time()

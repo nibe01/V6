@@ -57,6 +57,7 @@ class ConfigValidator:
         # Validate each section
         self._validate_scanner_config(config.get("scanner"))
         self._validate_ib_config(config.get("ib"))
+        self._validate_monitor_config(config.get("monitor"))
         self._validate_strategy_config(config.get("strategy"))
         self._validate_trading_config(config.get("trading"))
 
@@ -589,6 +590,76 @@ class ConfigValidator:
                 )
             )
 
+    def _validate_monitor_config(self, cfg) -> None:
+        """Validates monitor config."""
+        if not cfg:
+            self.errors.append(
+                ValidationError(
+                    section="monitor",
+                    field="*",
+                    value=None,
+                    reason="Monitor config missing",
+                    severity="ERROR",
+                )
+            )
+            return
+
+        numeric_fields = [
+            ("heartbeat_interval_seconds", 1.0, 3600.0),
+            ("position_update_interval_seconds", 1.0, 3600.0),
+            ("account_update_interval_seconds", 5.0, 24 * 3600.0),
+            ("pre_market_start_minutes", 0.0, 24 * 60.0),
+            ("post_market_stop_minutes", 0.0, 24 * 60.0),
+        ]
+
+        for field, min_value, max_value in numeric_fields:
+            value = getattr(cfg, field, None)
+            if not isinstance(value, (int, float)):
+                self.errors.append(
+                    ValidationError(
+                        section="monitor",
+                        field=field,
+                        value=value,
+                        reason=f"Must be numeric, got {type(value).__name__}",
+                        severity="ERROR",
+                    )
+                )
+                continue
+
+            if value < min_value:
+                self.errors.append(
+                    ValidationError(
+                        section="monitor",
+                        field=field,
+                        value=value,
+                        reason=f"Must be >= {min_value}",
+                        severity="ERROR",
+                    )
+                )
+                continue
+
+            if value > max_value:
+                self.errors.append(
+                    ValidationError(
+                        section="monitor",
+                        field=field,
+                        value=value,
+                        reason=f"Must be <= {max_value}",
+                        severity="ERROR",
+                    )
+                )
+
+        if not isinstance(getattr(cfg, "end_of_day_report", None), bool):
+            self.errors.append(
+                ValidationError(
+                    section="monitor",
+                    field="end_of_day_report",
+                    value=getattr(cfg, "end_of_day_report", None),
+                    reason="Must be bool",
+                    severity="ERROR",
+                )
+            )
+
     def _validate_trading_config(self, cfg) -> None:
         """Validates trading config."""
         if not cfg:
@@ -1093,6 +1164,110 @@ class ConfigValidator:
                         value=cfg.signal_queue_warning_interval_seconds,
                         reason="Very high warning interval (>24h)",
                         severity="WARNING",
+                    )
+                )
+
+        # signal_queue_rotate_bytes
+        if hasattr(cfg, 'signal_queue_rotate_bytes'):
+            if not isinstance(cfg.signal_queue_rotate_bytes, int):
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="signal_queue_rotate_bytes",
+                        value=cfg.signal_queue_rotate_bytes,
+                        reason=(
+                            "Must be int, got "
+                            f"{type(cfg.signal_queue_rotate_bytes).__name__}"
+                        ),
+                        severity="ERROR",
+                    )
+                )
+            elif cfg.signal_queue_rotate_bytes < 5 * 1024 * 1024:
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="signal_queue_rotate_bytes",
+                        value=cfg.signal_queue_rotate_bytes,
+                        reason="Must be >= 5MB (5 * 1024 * 1024)",
+                        severity="ERROR",
+                    )
+                )
+
+        # signal_queue_retention_files
+        if hasattr(cfg, 'signal_queue_retention_files'):
+            if not isinstance(cfg.signal_queue_retention_files, int):
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="signal_queue_retention_files",
+                        value=cfg.signal_queue_retention_files,
+                        reason=(
+                            "Must be int, got "
+                            f"{type(cfg.signal_queue_retention_files).__name__}"
+                        ),
+                        severity="ERROR",
+                    )
+                )
+            elif cfg.signal_queue_retention_files < 1:
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="signal_queue_retention_files",
+                        value=cfg.signal_queue_retention_files,
+                        reason="Must be >= 1",
+                        severity="ERROR",
+                    )
+                )
+
+        # processed_state_retention_days
+        if hasattr(cfg, 'processed_state_retention_days'):
+            if not isinstance(cfg.processed_state_retention_days, int):
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="processed_state_retention_days",
+                        value=cfg.processed_state_retention_days,
+                        reason=(
+                            "Must be int, got "
+                            f"{type(cfg.processed_state_retention_days).__name__}"
+                        ),
+                        severity="ERROR",
+                    )
+                )
+            elif cfg.processed_state_retention_days < 1:
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="processed_state_retention_days",
+                        value=cfg.processed_state_retention_days,
+                        reason="Must be >= 1 day",
+                        severity="ERROR",
+                    )
+                )
+
+        # processed_state_cleanup_interval_seconds
+        if hasattr(cfg, 'processed_state_cleanup_interval_seconds'):
+            if not isinstance(cfg.processed_state_cleanup_interval_seconds, int):
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="processed_state_cleanup_interval_seconds",
+                        value=cfg.processed_state_cleanup_interval_seconds,
+                        reason=(
+                            "Must be int, got "
+                            f"{type(cfg.processed_state_cleanup_interval_seconds).__name__}"
+                        ),
+                        severity="ERROR",
+                    )
+                )
+            elif cfg.processed_state_cleanup_interval_seconds < 60:
+                self.errors.append(
+                    ValidationError(
+                        section="trading",
+                        field="processed_state_cleanup_interval_seconds",
+                        value=cfg.processed_state_cleanup_interval_seconds,
+                        reason="Must be >= 60 seconds",
+                        severity="ERROR",
                     )
                 )
 

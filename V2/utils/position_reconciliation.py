@@ -84,7 +84,7 @@ class PositionReconciliator:
         bot_positions = self._get_bot_active_positions(processed)
 
         # Step 2b: Record manual positions before discrepancy checks
-        self._ensure_manual_entries(processed, ib_positions, bot_positions)
+        self._ensure_manual_entries(ib, processed, ib_positions, bot_positions)
 
         # Step 3: Bot positions missing in IB
         for symbol, bot_data in bot_positions.items():
@@ -188,6 +188,7 @@ class PositionReconciliator:
 
     def _ensure_manual_entries(
         self,
+        ib: IB,
         processed: Dict[str, dict],
         ib_positions: Dict[str, dict],
         bot_positions: Dict[str, dict],
@@ -202,11 +203,13 @@ class PositionReconciliator:
                 continue
 
             manual_key = f"manual_{symbol}"
+            opened_at = self._infer_position_opened_at_from_ib(ib, symbol) or now
             processed[manual_key] = {
                 "symbol": symbol,
                 "processed_at": now,
                 "first_seen_at": now,
                 "last_seen_at": now,
+                "opened_at": opened_at,
                 "status": BOT_STATUS_MANUAL,
                 "note": "detected from IB positions",
                 "quantity": ib_pos.get("quantity", 0),
@@ -214,6 +217,42 @@ class PositionReconciliator:
                 "market_value": ib_pos.get("market_value", 0.0),
                 "unrealized_pnl": ib_pos.get("unrealized_pnl", 0.0),
             }
+
+    def _infer_position_opened_at_from_ib(self, ib: IB, symbol: str) -> Optional[str]:
+        """Best-effort timestamp for when a position was opened (latest BUY fill)."""
+        latest_buy_fill_time: Optional[datetime] = None
+
+        for trade in ib.trades():
+            contract = getattr(trade, "contract", None)
+            if not contract or getattr(contract, "symbol", None) != symbol:
+                continue
+
+            order = getattr(trade, "order", None)
+            action = str(getattr(order, "action", "")).upper()
+            if action != "BUY":
+                continue
+
+            fills = getattr(trade, "fills", None) or []
+            for fill in fills:
+                execution = getattr(fill, "execution", None)
+                if execution is None:
+                    continue
+
+                shares = int(getattr(execution, "shares", 0) or 0)
+                exec_time = getattr(execution, "time", None)
+                if shares <= 0 or not isinstance(exec_time, datetime):
+                    continue
+
+                if latest_buy_fill_time is None or exec_time > latest_buy_fill_time:
+                    latest_buy_fill_time = exec_time
+
+        if latest_buy_fill_time is None:
+            return None
+
+        if latest_buy_fill_time.tzinfo is None:
+            latest_buy_fill_time = latest_buy_fill_time.replace(tzinfo=timezone.utc)
+
+        return latest_buy_fill_time.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
     def _sync_manual_positions(
         self,
@@ -241,6 +280,12 @@ class PositionReconciliator:
                 trade_data["market_value"] = ib_pos.get("market_value", 0.0)
                 trade_data["unrealized_pnl"] = ib_pos.get("unrealized_pnl", 0.0)
                 trade_data["last_seen_at"] = now
+                if not trade_data.get("opened_at"):
+                    trade_data["opened_at"] = (
+                        trade_data.get("first_seen_at")
+                        or trade_data.get("processed_at")
+                        or now
+                    )
             else:
                 trade_data["status"] = BOT_STATUS_MANUAL_CLOSED
                 trade_data["closed_at"] = now

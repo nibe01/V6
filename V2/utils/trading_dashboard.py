@@ -123,13 +123,20 @@ class TradingDashboard:
                     "entry_price", 0
                 )
                 quantity = trade_data.get("quantity", 0)
-                opened_at = trade_data.get("filled_at", "")
+                opened_at = (
+                    trade_data.get("opened_at")
+                    or trade_data.get("filled_at")
+                    or trade_data.get("signal_timestamp")
+                    or trade_data.get("processed_at", "")
+                )
                 source = "BOT"
 
                 if status == "manual":
                     entry_price = trade_data.get("avg_cost", entry_price)
-                    opened_at = trade_data.get("first_seen_at") or trade_data.get(
-                        "processed_at", ""
+                    opened_at = (
+                        trade_data.get("opened_at")
+                        or trade_data.get("first_seen_at")
+                        or trade_data.get("processed_at", "")
                     )
                     source = "MANUAL"
 
@@ -369,7 +376,10 @@ class TradingDashboard:
                         "pnl_usd": trade_data.get("realized_pnl_usd", 0.0),
                         "pnl_pct": trade_data.get("realized_pnl_pct", 0.0),
                         "duration": self._calculate_duration(
-                            trade_data.get("filled_at", ""),
+                            trade_data.get("opened_at")
+                            or trade_data.get("filled_at")
+                            or trade_data.get("signal_timestamp")
+                            or trade_data.get("processed_at", ""),
                             trade_data.get("closed_at", ""),
                         ),
                         "close_reason": trade_data.get("close_reason", "unknown"),

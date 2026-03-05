@@ -1,56 +1,69 @@
 # V2 Trading System
 
-V2 ist ein automatisiertes Trading-System mit drei Prozessen:
+V2 ist ein mehrprozessiges Trading-System für Interactive Brokers (IB), ausgelegt für stabilen Dauerbetrieb.
 
-- `monitor/broker_monitor.py` läuft 24/7, hält die IB-Verbindung und steuert Scanner/Trader.
-- `scanner/scanner_edge.py` erzeugt Signale aus einem mehrstufigen Edge-Filter.
-- `trader/trader_live.py` verarbeitet diese Signale und führt Trades mit TP/SL-Risikologik aus.
+Die drei Kernprozesse:
+- `monitor/broker_monitor.py`: läuft 24/7, hält IB-Verbindung und startet/stoppt Scanner+Trader nach Zeitfenster.
+- `scanner/scanner_edge.py`: bewertet das Symboluniversum mit einer mehrstufigen Edge-Pipeline.
+- `trader/trader_live.py`: verarbeitet Signale, platziert Orders und verwaltet Positionen/Schutzorders.
 
-## Architektur
+## Kernprinzipien
+
+- Eine zentrale Konfiguration: `config.py`
+- Startvalidierung aller Config-Werte: `utils/config_validator.py`
+- Zustandsdateien mit Locking + atomischem Schreiben: `utils/state_utils.py`
+- IB-Reconnect und Health-Checks in allen relevanten Loops
+- Dauerbetrieb-Features:
+  - tägliche Log-Rotation über Mitternacht
+  - Queue-Kompaktierung mit Retention
+  - State-Retention für alte Trades
+  - dynamischer NYSE-Feiertagskalender über `holidays`
+
+## Projektstruktur
 
 ```text
 V2/
-├── config.py                     # Zentrale Dataclass-Konfiguration
+├── config.py
 ├── monitor/
-│   ├── broker_monitor.py         # 24/7 Broker-Monitor (Haupt-Einstiegspunkt)
-│   ├── position_tracker.py       # Positions- und P&L-Tracking
-│   └── process_manager.py        # Subprocess-Verwaltung für Scanner+Trader
+│   ├── broker_monitor.py
+│   ├── position_tracker.py
+│   └── process_manager.py
 ├── scanner/
-│   ├── scanner_edge.py           # Signal-Pipeline (Edge Scanner)
-│   ├── edge_filters.py           # Ebenen 0-5 Filterlogik
-│   ├── edge_signals.py           # Signal-Datenstruktur
-│   └── historical_signals.py     # Historische Datenhilfen
+│   ├── scanner_edge.py
+│   ├── edge_filters.py
+│   ├── edge_signals.py
+│   └── historical_signals.py
 ├── trader/
-│   ├── trader_live.py            # Live-Trading Loop
-│   └── order_verification.py     # Order-/Bracket-Checks
+│   ├── trader_live.py
+│   └── order_verification.py
 ├── utils/
-│   ├── ib_connection.py          # Robustes Connect/Reconnect zu IB
-│   ├── market_schedule.py        # NYSE Marktzeiten (neu)
-│   ├── rate_limiter.py           # API-Limitschutz
-│   ├── account_checker.py        # Kontostand/Buying-Power Checks
-│   ├── position_reconciliation.py# State vs. IB Reconciliation
-│   ├── trade_status.py           # Gemeinsame Status-Quelle
+│   ├── ib_connection.py
+│   ├── market_schedule.py
+│   ├── rate_limiter.py
+│   ├── state_utils.py
+│   ├── state_retry.py
+│   ├── config_validator.py
 │   └── ...
-├── data/                         # Symboluniversum
-├── output/                       # Signal-Queue + Archiv
-└── state/                        # Laufzeit-State (Positions/Verluste/Cooldowns)
+├── data/
+├── output/
+├── logs/
+└── state/
 ```
 
-## Laufzeitfluss
+## Laufzeitverhalten
 
-```text
-00:00–09:28 ET  broker_monitor läuft, Scanner+Trader pausiert
-09:30 ET        broker_monitor startet scanner_edge + trader_live
-09:30–16:00 ET  Normaler Handelsbetrieb
-16:00 ET        broker_monitor stoppt scanner_edge + trader_live
-16:00–16:05 ET  End-of-Day Report wird erstellt
-16:05–23:59 ET  broker_monitor läuft, überwacht offene Positionen
-```
+Der Monitor läuft dauerhaft. Scanner und Trader laufen nur im konfigurierten Aktivitätsfenster:
 
-## Scanner-Logik (Edge Pipeline)
+- Start: `market_open - pre_market_start_minutes`
+- Stop: `market_close + post_market_stop_minutes`
 
-Der Scanner nutzt folgende Ebenen:
+Beispiel mit `pre_market_start_minutes=150`:
+- NYSE Open 09:30 ET
+- Scanner/Trader starten um 07:00 ET
 
+## Scanner-Pipeline (Edge)
+
+Stufen:
 - Ebene 0: Price Range
 - Ebene 1: Movement Capability
 - Ebene 2: Volume Activity
@@ -58,119 +71,96 @@ Der Scanner nutzt folgende Ebenen:
 - Ebene 4: Catalyst (optional)
 - Ebene 5: Risk Control (optional)
 
-Die Schwellenwerte werden in `config.py` über `EdgeScannerConfig` und Sub-Configs (`PriceRangeConfig`, `MovementConfig`, `VolumeConfig`, `DirectionConfig`, `CatalystConfig`, `RiskConfig`) gesteuert.
+Parameter liegen in `EdgeScannerConfig` und Sub-Configs in `config.py`.
 
-## Trading- und Risiko-Logik
+## Trader-Logik (Kurz)
 
-Wichtige Punkte im Live-Trader:
+- Liest neue Signale aus `output/signals.jsonl` inkrementell per Offset
+- Verhindert Doppel-Entries pro Symbol
+- Entry mit Slippage-Schutz (Limit bevorzugt)
+- TP/SL-Schutzorders + Verifikation
+- Reconciliation mit IB, inkl. Recovery-Pfaden
+- Daily-Loss-Guard, Cooldowns, Queue-/State-Housekeeping
 
-- Einheitliches Position Sizing (`position_size_pct`, auto/manual max trades)
-- Entry mit Slippage-Schutz (`use_limit_entry`, `max_entry_slippage_pct`)
-- Fill-first Ablauf: TP/SL werden vom tatsächlichen Fill-Preis berechnet
-- Schutz bei fehlenden Exit-Orders (Recovery + optional Emergency Exit)
-- Daily-Loss-Limit (`max_daily_stop_losses`)
-- Symbol-Cooldown nach Events
-- Regelmäßige Reconciliation zwischen IB und internem State
+## Dauerbetrieb & Retention
 
-Statuswerte sind zentralisiert in `utils/trade_status.py`, damit Trader und Reconciliator dieselbe Semantik verwenden.
+### Logs
+- Tägliche Rotation automatisch über Mitternacht (`utils/logging_utils.py`).
 
-## Signal Queue Handling
+### Signal-Queue
+- Warnung ab `trading.signal_queue_warning_bytes`
+- Sichere Kompaktierung ab `trading.signal_queue_rotate_bytes`
+- Rotierte Queue-Dateien begrenzt über `trading.signal_queue_retention_files`
 
-`output/signals.jsonl` wird bewusst als append-only Queue behandelt:
+### Processed State
+- Alte abgeschlossene/abgelehnte/manual-closed Einträge werden entfernt
+- Aufbewahrung über `trading.processed_state_retention_days`
+- Cleanup-Intervall über `trading.processed_state_cleanup_interval_seconds`
 
-- Scanner hängt Zeilen an.
-- Trader liest nur neue Zeilen über Dateioffset.
-- Trader archiviert verarbeitete Zeilen zusätzlich in `output/signals_archive.jsonl`.
-- Keine automatische Trunkierung der Queue-Datei (Race-Condition-Vermeidung).
-- Warnungen bei zu großer Queue über:
-  - `trading.signal_queue_warning_bytes`
-  - `trading.signal_queue_warning_interval_seconds`
+## Konfiguration (wichtigste Blöcke)
 
-## Konfiguration
+- `IBConfig`: TWS/Gateway-Verbindung, Client-IDs, RTH/EH-Daten
+- `MonitorConfig`: Herzschlag + Aktivitätsfenster
+- `StrategyConfig`: Regelkombination + historische Bars
+- `TradingConfig`: Sizing, Risk, Execution, Retention
+- `EdgeScannerConfig`: Filter- und Scannerparameter
 
-Alle relevanten Einstellungen liegen in `config.py` (Dataclasses) und werden beim Start validiert (`utils/config_validator.py`).
+Alle Felder sind direkt in `config.py` kommentiert (Einheit, Wirkung, typische Bedeutung).
 
-Wichtige Bereiche:
+## Start
 
-- `IBConfig`: Host, Port, Client IDs, Connection-Check Intervall
-- `StrategyConfig`: Rule-Operator + historische Bar-Settings
-- `TradingConfig`: Risiko, Positionierung, Execution, Queue-Warnung
-- `EdgeScannerConfig`: Filterparameter und Scan-Intervalle
+Aus `V2/` starten.
 
-Hinweis: Scanner- und Trader-Client-ID müssen unterschiedlich sein.
-
-## Starten
-
-Arbeitsverzeichnis ist der Projektordner `V2/`.
-
-Empfohlen (Monitor steuert alles automatisch):
+Empfohlen (Produktivbetrieb):
 
 ```bash
 python3 -m monitor.broker_monitor
 ```
 
-Alternativ manuell (Entwicklung/Debugging):
+Manuell (Debug):
 
 ```bash
-python3 -m scanner.scanner_edge   # Terminal 1
-python3 -m trader.trader_live     # Terminal 2
+python3 -m scanner.scanner_edge
+python3 -m trader.trader_live
 ```
 
-## Statistik-Logs (Scanner)
+## Dependencies
 
-Der Scanner loggt eine Pipeline-Statistik in konfigurierbaren Intervallen
-(`edge_scanner.stats_log_interval_blocks`) sowie einen detaillierten Snapshot alle 50 Blöcke.
+`requirements.txt` enthält aktuell:
+- `holidays>=0.67`
 
-Beispiel:
+Installieren:
 
-```text
-================================================================================================
-EDGE SCANNER PIPELINE STATS
-================================================================================================
-Total scanned: 5000
-Stage                  Passed     Cum %    Step %   Filtered
-------------------------------------------------------------------------------------------------
-Ebene 0 Price            4500     90.0%    90.0%        500
-Ebene 1 Move             1000     20.0%    22.2%       3500
-Ebene 2 Volume            500     10.0%    50.0%        500
-Ebene 3 Direction         250      5.0%    50.0%        250
-Ebene 4 Catalyst          150      3.0%    60.0%        100
-Ebene 5 Risk              120      2.4%    80.0%         30
-Final Signals             120      2.4%   100.0%          0
-------------------------------------------------------------------------------------------------
-Funnel: 5000 -> 4500 -> 1000 -> 500 -> 250 -> 150 -> 120
-================================================================================================
+```bash
+pip install -r requirements.txt
 ```
 
-## Daten und State-Dateien
+## Wichtige Dateien zur Beobachtung
 
-- `data/extended_symbols.csv`: Symboluniversum
-- `output/signals.jsonl`: Scanner-Queue
-- `output/signals_archive.jsonl`: archivierte Signalzeilen
-- `state/processed_signals.json`: Trade-State
-- `state/daily_losses.json`: Daily-Loss-Zähler
+- Signal-Queue: `output/signals.jsonl`
+- Signal-Archiv: `output/signals_archive.jsonl`
+- Trade-State: `state/processed_signals.json`
+- Daily Loss Counter: `state/daily_losses.json`
+- Monitor-State: `state/monitor_state.json`
 
 ## Troubleshooting
 
 Keine Signale:
+- Marktdaten/IB-Verbindung prüfen
+- Filter in `EdgeScannerConfig` ggf. zu streng
+- `use_rth` vs. Pre-/Post-Market beachten
 
-- IB/TWS/Gateway läuft nicht oder API nicht aktiviert
-- Filterparameter zu streng
-- Keine verwertbaren historischen Daten
+Keine Entries trotz Signalen:
+- Daily-Loss-Limit erreicht
+- Symbol im Cooldown
+- Offene Position/Order bereits vorhanden
+- Account/Buying-Power-Checks blocken
 
-Keine Orders/abgebrochene Orders:
+Queue wächst stark:
+- Trader-Loop läuft nicht stabil
+- Scanner produziert mehr als verarbeitet wird
+- Warn-/Rotate-Schwellen in `TradingConfig` anpassen
 
-- Buying Power / Account Checks schlagen fehl
-- Slippage-Limit zu eng
-- Reconnect/Connection-Probleme in IB
+## Hinweis
 
-Zu viele Queue-Warnungen:
-
-- Trader läuft nicht oder zu langsam
-- Scanner produziert mehr Signale als verarbeitet werden
-- Threshold in `TradingConfig` prüfen
-
-## Hinweise
-
-- `main.py` ist aktuell leer und kein Einstiegspunkt.
-- Projekt ist für internen/proprietären Einsatz gedacht.
+`main.py` ist kein aktiver Einstiegspunkt. Verwende die Modulstarts oben.

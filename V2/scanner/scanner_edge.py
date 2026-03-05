@@ -2,9 +2,6 @@
 """
 Edge Scanner - 6-Level Filter Logic for Statistical Edge Detection
 
-Usage:
-    cd "/Users/nielsbergmann/Programmieren/V4/V2"
-    python3 -m scanner.scanner_edge
 """
 from __future__ import annotations
 
@@ -26,6 +23,7 @@ from utils.logging_utils import setup_logging
 from utils.market_schedule import MarketSchedule
 from utils.data_utils import load_extended_symbols
 from utils.paths import OUTPUT_DIR
+from utils.state_utils import file_lock
 from config import validate_and_get_config
 from utils.ib_connection import IBConnectionManager, ConnectionConfig
 from utils.rate_limiter import get_rate_limiter, RateLimitConfig
@@ -317,8 +315,11 @@ def save_signal_for_trader(signal: EdgeSignal, output_path: Path):
         },
     }
 
-    with open(output_path, "a", encoding="utf-8") as f:
+    # Use the same file lock as the trader compaction path to avoid queue races.
+    with file_lock(output_path, timeout=10.0, mode="exclusive") as f:
+        f.seek(0, 2)
         f.write(json.dumps(trader_signal) + "\n")
+        f.flush()
 
 
 def main():
@@ -330,6 +331,7 @@ def main():
     cfg = validate_and_get_config()
     edge_cfg = cfg["edge_scanner"]
     ib_cfg = cfg["ib"]
+    monitor_cfg = cfg["monitor"]
     strat_cfg = cfg["strategy"]
     stats_log_interval_blocks = max(
         1, int(getattr(edge_cfg, "stats_log_interval_blocks", 10))
@@ -340,13 +342,13 @@ def main():
     logger.info(f"Loaded universe: {len(symbols)} symbols")
     logger.info(f"BLOCK_SIZE={edge_cfg.block_size}, SLEEP={edge_cfg.block_sleep_seconds}")
     logger.info(f"Stats log interval: every {stats_log_interval_blocks} block(s)")
-    logger.info("Edge Scanner (Primary Scanner)")
+    logger.info("Edge Scanner")
     logger.info("Edge Scanner with 6-Level Filter Logic")
     
     # Output setup
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / "signals.jsonl"
-    logger.info(f"Signals output: {out_path} (Primary Scanner)")
+    logger.info(f"Signals output: {out_path}")
     
     logger.info("=" * 80)
     logger.info("Setting up IB Connection Manager")
@@ -432,12 +434,23 @@ def main():
     i = 0
     blocks_processed = 0
     market_schedule = MarketSchedule()
+    pre_market_start_minutes = max(0.0, float(monitor_cfg.pre_market_start_minutes))
+    post_market_stop_minutes = max(0.0, float(monitor_cfg.post_market_stop_minutes))
     try:
         while True:
-            if not market_schedule.is_market_open():
-                wait_seconds = min(market_schedule.seconds_until_open(), 60.0)
+            if not market_schedule.is_active_trading_window(
+                pre_market_start_minutes=pre_market_start_minutes,
+                post_market_stop_minutes=post_market_stop_minutes,
+            ):
+                wait_seconds = min(
+                    market_schedule.seconds_until_active_window(
+                        pre_market_start_minutes=pre_market_start_minutes,
+                        post_market_stop_minutes=post_market_stop_minutes,
+                    ),
+                    60.0,
+                )
                 logger.info(
-                    "Markt geschlossen (%s) – Scanner pausiert für %.0fs",
+                    "Außerhalb Aktivitätsfenster (%s) – Scanner pausiert für %.0fs",
                     market_schedule.get_status_string(),
                     wait_seconds,
                 )

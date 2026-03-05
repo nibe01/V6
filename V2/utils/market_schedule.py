@@ -8,10 +8,20 @@ from datetime import date, datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 
+from utils.logging_utils import get_logger
+
+try:
+    import holidays  # type: ignore
+except Exception:  # pragma: no cover - fallback path
+    holidays = None
+
+
+logger = get_logger(__name__)
+
 ET = ZoneInfo("America/New_York")
 
-# NYSE Feiertage 2025 und 2026 (ISO-Format)
-NYSE_HOLIDAYS = {
+# Fallback-Feiertage (wenn holidays-Library nicht verfügbar ist)
+NYSE_HOLIDAYS_FALLBACK = {
     "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18",
     "2025-05-26", "2025-07-04", "2025-09-01", "2025-11-27",
     "2025-11-28", "2025-12-25",
@@ -25,6 +35,17 @@ MARKET_CLOSE = dt_time(16, 0)
 
 
 class MarketSchedule:
+        def __init__(self) -> None:
+            self._holiday_calendar = None
+            if holidays is not None:
+                try:
+                    self._holiday_calendar = holidays.NYSE()  # type: ignore[attr-defined]
+                except Exception as e:
+                    logger.warning("Could not initialize holidays.NYSE calendar, using fallback set: %s", e)
+                    self._holiday_calendar = None
+            else:
+                logger.warning("holidays library not available, using static NYSE fallback holidays")
+
     """
     Prüft NYSE-Marktzeiten unter Berücksichtigung von Wochenenden und Feiertagen.
     Alle Zeitangaben in US Eastern Time (ET).
@@ -48,12 +69,66 @@ class MarketSchedule:
             return False
         return MARKET_OPEN <= now.time() < MARKET_CLOSE
 
+    def is_active_trading_window(
+        self,
+        pre_market_start_minutes: float = 0.0,
+        post_market_stop_minutes: float = 0.0,
+    ) -> bool:
+        """
+        Gibt True zurück, wenn wir im konfigurierten Aktivitätsfenster sind.
+
+        Aktivitätsfenster = [market_open - pre_market_start_minutes,
+                            market_close + post_market_stop_minutes)
+        """
+        now = self._now_et()
+        today = now.date()
+        if not self.is_trading_day(today):
+            return False
+
+        open_dt = self._open_datetime(today)
+        close_dt = self._close_datetime(today)
+        start_dt = open_dt - timedelta(minutes=max(0.0, pre_market_start_minutes))
+        stop_dt = close_dt + timedelta(minutes=max(0.0, post_market_stop_minutes))
+        return start_dt <= now < stop_dt
+
+    def seconds_until_active_window(
+        self,
+        pre_market_start_minutes: float = 0.0,
+        post_market_stop_minutes: float = 0.0,
+    ) -> float:
+        """
+        Sekunden bis zum nächsten Start des konfigurierten Aktivitätsfensters.
+        0 wenn wir bereits im Fenster sind.
+        """
+        if self.is_active_trading_window(
+            pre_market_start_minutes=pre_market_start_minutes,
+            post_market_stop_minutes=post_market_stop_minutes,
+        ):
+            return 0.0
+
+        now = self._now_et()
+        today = now.date()
+        start_today = self._open_datetime(today) - timedelta(
+            minutes=max(0.0, pre_market_start_minutes)
+        )
+
+        if self.is_trading_day(today) and now < start_today:
+            return max(0.0, (start_today - now).total_seconds())
+
+        next_day = self._next_trading_day(today + timedelta(days=1))
+        next_start = self._open_datetime(next_day) - timedelta(
+            minutes=max(0.0, pre_market_start_minutes)
+        )
+        return max(0.0, (next_start - now).total_seconds())
+
     def is_trading_day(self, d: Optional[date] = None) -> bool:
         """Gibt True zurück wenn der angegebene Tag (default: heute) ein Handelstag ist."""
         day = d or self._now_et().date()
         if day.weekday() >= 5:
             return False
-        return day.isoformat() not in NYSE_HOLIDAYS
+        if self._holiday_calendar is not None:
+            return day not in self._holiday_calendar
+        return day.isoformat() not in NYSE_HOLIDAYS_FALLBACK
 
     def _next_trading_day(self, from_day: date) -> date:
         probe = from_day

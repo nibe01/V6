@@ -1,0 +1,4 @@
+ib-insync>=0.9.86
+numpy>=1.26.0
+pandas>=2.1.0
+holidays>=0.67

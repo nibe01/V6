@@ -27,6 +27,54 @@ class LogCategory(Enum):
     DEBUG = "debug"         # Detailliertes Debug-Log
 
 
+class DailyFileHandler(logging.FileHandler):
+    """
+    File handler that switches to a new file when the calendar date changes.
+
+    This keeps one log file per day even for long-running 24/7 processes.
+    """
+
+    def __init__(self, log_dir: Path, file_prefix: str, encoding: str = "utf-8"):
+        self.log_dir = Path(log_dir)
+        self.file_prefix = file_prefix
+        self.current_date = self._today()
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        initial_file = self.log_dir / f"{self.file_prefix}_{self.current_date}.log"
+        super().__init__(initial_file, encoding=encoding)
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _rotate_if_needed(self) -> None:
+        today = self._today()
+        if today == self.current_date:
+            return
+
+        self.acquire()
+        try:
+            today = self._today()
+            if today == self.current_date:
+                return
+
+            if self.stream:
+                self.stream.flush()
+                self.stream.close()
+                self.stream = None
+
+            self.current_date = today
+            new_file = self.log_dir / f"{self.file_prefix}_{self.current_date}.log"
+            self.baseFilename = str(new_file.resolve())
+            self.stream = self._open()
+        finally:
+            self.release()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._rotate_if_needed()
+        super().emit(record)
+
+
 class MultiLogger:
     """
     Verwaltet mehrere Logger gleichzeitig.
@@ -50,8 +98,6 @@ class MultiLogger:
 
     def _setup_loggers(self):
         """Erstellt alle Logger mit eigenen Dateien."""
-        today = datetime.now().strftime("%Y-%m-%d")
-
         # Formatter
         detailed_formatter = logging.Formatter(
             "%(asctime)s | %(levelname)-8s | %(message)s"
@@ -73,9 +119,11 @@ class MultiLogger:
             # Datei-Handler
             log_dir = LOGS_DIR / category.value
             log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"{category.value}_{today}.log"
-
-            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler = DailyFileHandler(
+                log_dir=log_dir,
+                file_prefix=category.value,
+                encoding="utf-8",
+            )
             file_handler.setLevel(main_level)
 
             # MAIN, DEBUG und ERRORS bekommen detailed formatter
