@@ -35,21 +35,26 @@ MARKET_CLOSE = dt_time(16, 0)
 
 
 class MarketSchedule:
-        def __init__(self) -> None:
-            self._holiday_calendar = None
-            if holidays is not None:
-                try:
-                    self._holiday_calendar = holidays.NYSE()  # type: ignore[attr-defined]
-                except Exception as e:
-                    logger.warning("Could not initialize holidays.NYSE calendar, using fallback set: %s", e)
-                    self._holiday_calendar = None
-            else:
-                logger.warning("holidays library not available, using static NYSE fallback holidays")
-
     """
     Prüft NYSE-Marktzeiten unter Berücksichtigung von Wochenenden und Feiertagen.
     Alle Zeitangaben in US Eastern Time (ET).
     """
+
+    def __init__(self) -> None:
+        self._holiday_calendar = None
+        if holidays is not None:
+            try:
+                self._holiday_calendar = holidays.NYSE()  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.warning(
+                    "Could not initialize holidays.NYSE calendar, using fallback set: %s",
+                    e,
+                )
+                self._holiday_calendar = None
+        else:
+            logger.warning(
+                "holidays library not available, using static NYSE fallback holidays"
+            )
 
     @staticmethod
     def _now_et() -> datetime:
