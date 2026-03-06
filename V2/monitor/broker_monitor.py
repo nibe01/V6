@@ -27,6 +27,9 @@ from utils.state_utils import save_state
 from utils.symbol_cooldown import SymbolCooldownManager
 
 
+PERFORMANCE_LOG_INTERVAL_SECONDS = 30 * 60
+
+
 def _build_monitor_state(
     *,
     ib_connected: bool,
@@ -76,6 +79,21 @@ def _build_monitor_state(
         "today_trades": today_trades,
         "today_pnl_usd": round(today_pnl, 2),
     }
+
+
+def _log_monitor_performance(logger, monitor_state: dict, market_status: str) -> None:
+    """Write a compact monitor snapshot into the performance log."""
+    logger.performance(
+        "Monitor Snapshot | Market: %s | IB: %s | Scanner: %s | Trader: %s | "
+        "Open Positions: %s | Today Trades: %s | Today P&L: $%+.2f",
+        market_status,
+        "connected" if monitor_state.get("ib_connected") else "disconnected",
+        "running" if monitor_state.get("scanner_running") else "stopped",
+        "running" if monitor_state.get("trader_running") else "stopped",
+        int(monitor_state.get("open_positions", 0) or 0),
+        int(monitor_state.get("today_trades", 0) or 0),
+        float(monitor_state.get("today_pnl_usd", 0.0) or 0.0),
+    )
 
 
 def main() -> None:
@@ -133,6 +151,7 @@ def main() -> None:
     counted_sl_orders: set = set()
     last_position_update = 0.0
     last_account_update = 0.0
+    last_performance_log = 0.0
     scanner_started_for_session = False
     eod_done_for_day: str | None = None
 
@@ -231,6 +250,14 @@ def main() -> None:
                 )
                 if not save_state(monitor_state_path, monitor_state):
                     logger.warning("Konnte monitor_state nicht speichern")
+
+                if now_ts - last_performance_log >= PERFORMANCE_LOG_INTERVAL_SECONDS:
+                    _log_monitor_performance(
+                        logger=logger,
+                        monitor_state=monitor_state,
+                        market_status=market_schedule.get_status_string(),
+                    )
+                    last_performance_log = now_ts
 
                 logger.debug("Heartbeat: %s", market_schedule.get_status_string())
 

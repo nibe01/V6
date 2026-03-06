@@ -156,9 +156,26 @@ class PositionTracker:
                 entry_price = trade_data.get("fill_price") or trade_data.get("entry_price", 0)
                 quantity = trade_data.get("quantity", 0)
 
-                exit_price = resolve_exit_price(ib, symbol)
+                exit_price = resolve_exit_price(
+                    ib,
+                    symbol,
+                    require_confirmed_exit_fill=True,
+                )
 
-                if exit_price and exit_price > 0 and entry_price > 0 and quantity > 0:
+                if not (exit_price and exit_price > 0):
+                    # Keep trade open until we can confirm an actual exit fill from IB.
+                    if (
+                        missing_checks == POSITION_MISSING_CONFIRMATION_CHECKS
+                        or missing_checks % 20 == 0
+                    ):
+                        self.logger.warning(
+                            "EXIT-CHECK: %s missing from IB positions but no confirmed "
+                            "exit fill yet; keeping status as FILLED",
+                            symbol,
+                        )
+                    continue
+
+                if entry_price > 0 and quantity > 0:
                     pnl_usd, pnl_pct = calculate_realized_pnl(entry_price, exit_price, quantity)
                     processed[key]["exit_price"] = exit_price
                     processed[key]["realized_pnl_usd"] = pnl_usd
@@ -173,7 +190,11 @@ class PositionTracker:
                         quantity,
                     )
                 else:
-                    self.logger.trade("EXIT: %s | Position closed (P&L not available)", symbol)
+                    self.logger.trade(
+                        "EXIT: %s | Exit: $%.2f | P&L not available (missing entry/qty)",
+                        symbol,
+                        exit_price,
+                    )
 
                 processed[key]["status"] = BOT_STATUS_CLOSED
                 processed[key]["closed_at"] = datetime.now(timezone.utc).isoformat()

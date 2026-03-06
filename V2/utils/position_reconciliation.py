@@ -14,6 +14,7 @@ from ib_insync import IB
 from utils.logging_utils import get_logger
 from utils.trade_status import (
     BOT_STATUS_CLOSED,
+    BOT_STATUS_FILLED,
     BOT_STATUS_MANUAL,
     BOT_STATUS_MANUAL_CLOSED,
     is_bot_active_status,
@@ -186,6 +187,19 @@ class PositionReconciliator:
                 return True
         return False
 
+    def _has_any_bot_history(self, processed: Dict[str, dict], symbol: str) -> bool:
+        """Check whether symbol exists in non-manual bot state history."""
+        for trade_data in processed.values():
+            if not isinstance(trade_data, dict):
+                continue
+            if trade_data.get("symbol") != symbol:
+                continue
+
+            status = str(trade_data.get("status", "")).strip().lower()
+            if status and status not in {"manual", "manual_closed"}:
+                return True
+        return False
+
     def _ensure_manual_entries(
         self,
         ib: IB,
@@ -202,8 +216,34 @@ class PositionReconciliator:
             if self._has_manual_position(processed, symbol):
                 continue
 
-            manual_key = f"manual_{symbol}"
             opened_at = self._infer_position_opened_at_from_ib(ib, symbol) or now
+
+            if self._has_any_bot_history(processed, symbol):
+                recovered_key = f"recovered_history_{symbol}_{now}"
+                entry_price = float(ib_pos.get("avg_cost", 0.0) or 0.0)
+                processed[recovered_key] = {
+                    "symbol": symbol,
+                    "signal_timestamp": opened_at,
+                    "processed_at": now,
+                    "order_id": 0,
+                    "tp_order_id": None,
+                    "sl_order_id": None,
+                    "entry_price": entry_price,
+                    "fill_price": entry_price,
+                    "quantity": ib_pos.get("quantity", 0),
+                    "status": BOT_STATUS_FILLED,
+                    "filled_at": opened_at,
+                    "opened_at": opened_at,
+                    "note": "recovered_from_ib_bot_history",
+                }
+                logger.warning(
+                    "RECOVERY: %s restored as bot trade from IB position snapshot "
+                    "(history-based)",
+                    symbol,
+                )
+                continue
+
+            manual_key = f"manual_{symbol}"
             processed[manual_key] = {
                 "symbol": symbol,
                 "processed_at": now,
@@ -275,6 +315,32 @@ class PositionReconciliator:
 
             ib_pos = ib_positions.get(symbol)
             if ib_pos:
+                if (
+                    trade_data.get("note") == "detected from IB positions"
+                    and self._has_any_bot_history(processed, symbol)
+                ):
+                    opened_at = (
+                        trade_data.get("opened_at")
+                        or self._infer_position_opened_at_from_ib(ib, symbol)
+                        or now
+                    )
+                    entry_price = float(ib_pos.get("avg_cost", 0.0) or 0.0)
+
+                    trade_data["status"] = BOT_STATUS_FILLED
+                    trade_data["opened_at"] = opened_at
+                    trade_data["filled_at"] = trade_data.get("filled_at") or opened_at
+                    trade_data["entry_price"] = entry_price
+                    trade_data["fill_price"] = entry_price
+                    trade_data["quantity"] = ib_pos.get("quantity", 0)
+                    trade_data["note"] = "recovered_from_ib_bot_history"
+
+                    logger.warning(
+                        "RECOVERY: %s upgraded from detected manual to bot trade "
+                        "(history-based)",
+                        symbol,
+                    )
+                    continue
+
                 trade_data["quantity"] = ib_pos.get("quantity", 0)
                 trade_data["avg_cost"] = ib_pos.get("avg_cost", 0.0)
                 trade_data["market_value"] = ib_pos.get("market_value", 0.0)
@@ -473,7 +539,19 @@ class PositionReconciliator:
                 )
                 quantity = trade_data.get("quantity", 0)
 
-                exit_price = resolve_exit_price(ib, symbol)
+                exit_price = resolve_exit_price(
+                    ib,
+                    symbol,
+                    require_confirmed_exit_fill=True,
+                )
+
+                if not (exit_price and exit_price > 0):
+                    logger.warning(
+                        "RECONCILIATION-SKIP-CLOSE: %s missing in IB snapshot but no "
+                        "confirmed exit fill found; keeping status as FILLED",
+                        symbol,
+                    )
+                    return False
 
                 if exit_price and exit_price > 0 and entry_price > 0 and quantity > 0:
                     pnl_usd, pnl_pct = calculate_realized_pnl(
@@ -621,13 +699,63 @@ def get_last_fill_price(ib: IB, symbol: str) -> Optional[float]:
     return best_price
 
 
-def resolve_exit_price(ib: IB, symbol: str) -> Optional[float]:
+def get_last_exit_fill_price(ib: IB, symbol: str) -> Optional[float]:
+    """
+    Return most recent confirmed SELL/SLD execution price for a symbol.
+
+    Returns:
+        Exit fill price or None
+    """
+    best_price: Optional[float] = None
+    best_time: Optional[datetime] = None
+
+    for trade in ib.trades():
+        contract = getattr(trade, "contract", None)
+        if not contract or getattr(contract, "symbol", None) != symbol:
+            continue
+
+        fills = getattr(trade, "fills", []) or []
+        for fill in fills:
+            execution = getattr(fill, "execution", None)
+            if not execution:
+                continue
+
+            side = str(getattr(execution, "side", "") or "").upper()
+            if side not in {"SLD", "SELL"}:
+                continue
+
+            price = getattr(execution, "price", 0) or 0
+            exec_time = getattr(execution, "time", None)
+            if not price or price <= 0:
+                continue
+
+            if best_time is None or (
+                isinstance(exec_time, datetime) and exec_time > best_time
+            ):
+                best_time = exec_time if isinstance(exec_time, datetime) else best_time
+                best_price = float(price)
+
+    return best_price
+
+
+def resolve_exit_price(
+    ib: IB,
+    symbol: str,
+    require_confirmed_exit_fill: bool = False,
+) -> Optional[float]:
     """
     Resolve an exit price from recent fills, with market price fallback.
 
     Returns:
         Exit price or None
     """
+    confirmed_exit_price = get_last_exit_fill_price(ib, symbol)
+    if confirmed_exit_price and confirmed_exit_price > 0:
+        return confirmed_exit_price
+
+    if require_confirmed_exit_fill:
+        return None
+
     price = get_last_fill_price(ib, symbol)
     if price and price > 0:
         return price

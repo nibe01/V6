@@ -231,6 +231,26 @@ def _has_manual_position(symbol: str, processed: Dict[str, dict]) -> bool:
     return False
 
 
+def _has_any_bot_history(symbol: str, processed: Dict[str, dict]) -> bool:
+    """
+    Checks if the symbol has any non-manual history in bot state.
+
+    This helps avoid misclassifying old bot/API positions as manual after
+    restarts, day rollovers, or partial state drift.
+    """
+    for trade_data in processed.values():
+        if not isinstance(trade_data, dict):
+            continue
+        if trade_data.get("symbol") != symbol:
+            continue
+
+        status = str(trade_data.get("status", "")).strip().lower()
+        if status and status not in {"manual", "manual_closed"}:
+            return True
+
+    return False
+
+
 def _count_bot_open_positions(processed: Dict[str, dict]) -> int:
     """
     Zaehlt die Anzahl aktiver Bot-Positionen (nicht manuelle Trades).
@@ -552,9 +572,26 @@ def _update_position_status(
             )
             quantity = trade_data.get("quantity", 0)
 
-            exit_price = resolve_exit_price(ib, symbol)
+            exit_price = resolve_exit_price(
+                ib,
+                symbol,
+                require_confirmed_exit_fill=True,
+            )
 
-            if exit_price and exit_price > 0 and entry_price > 0 and quantity > 0:
+            if not (exit_price and exit_price > 0):
+                # Keep trade open until we can confirm an actual exit fill from IB.
+                if (
+                    missing_checks == POSITION_MISSING_CONFIRMATION_CHECKS
+                    or missing_checks % 20 == 0
+                ):
+                    context.logger.warning(
+                        "EXIT-CHECK: %s missing from IB positions but no confirmed "
+                        "exit fill yet; keeping status as FILLED",
+                        symbol,
+                    )
+                continue
+
+            if entry_price > 0 and quantity > 0:
                 pnl_usd, pnl_pct = calculate_realized_pnl(
                     entry_price, exit_price, quantity
                 )
@@ -570,7 +607,8 @@ def _update_position_status(
                 )
             else:
                 context.logger.trade(
-                    f"EXIT: {symbol} | Position closed (P&L not available)"
+                    f"EXIT: {symbol} | Exit: ${exit_price:.2f} | "
+                    "P&L not available (missing entry/qty)"
                 )
 
             processed[key]["status"] = BOT_STATUS_CLOSED
@@ -1633,6 +1671,58 @@ def _build_recovered_bot_trade_from_ib(
     return {"state_key": state_key, "state_data": state_data}
 
 
+def _build_history_based_bot_trade_from_ib(
+    context: TradingContext,
+    ib: IB,
+    symbol: str,
+) -> Optional[dict]:
+    """
+    Fallback recovery for symbols with bot history but no recoverable active BUY order.
+
+    Uses current IB position snapshot and keeps source as bot-managed.
+    """
+    qty = 0
+    avg_cost = 0.0
+
+    for position in ib.positions():
+        if position.contract.symbol != symbol:
+            continue
+        qty = int(abs(position.position))
+        avg_cost = float(getattr(position, "avgCost", 0.0) or 0.0)
+        break
+
+    if qty <= 0:
+        return None
+
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    opened_at = _infer_position_opened_at_from_ib(ib, symbol) or now
+    entry_price = avg_cost if avg_cost > 0 else 0.0
+
+    state_key = f"recovered_history_{symbol}_{now}"
+    state_data = {
+        "symbol": symbol,
+        "signal_timestamp": opened_at,
+        "processed_at": now,
+        "order_id": 0,
+        "tp_order_id": None,
+        "sl_order_id": None,
+        "entry_price": entry_price,
+        "fill_price": entry_price,
+        "quantity": qty,
+        "status": BOT_STATUS_FILLED,
+        "filled_at": opened_at,
+        "opened_at": opened_at,
+        "note": "recovered_from_ib_bot_history",
+    }
+
+    context.logger.warning(
+        "RECOVERY: %s restored as bot trade from IB position snapshot (history-based)",
+        symbol,
+    )
+
+    return {"state_key": state_key, "state_data": state_data}
+
+
 def _ensure_exit_protection_for_filled_positions(
     context: TradingContext,
     ib: IB,
@@ -2551,6 +2641,13 @@ def main():
                             ib=ib,
                             symbol=symbol,
                         )
+
+                        if not recovered and _has_any_bot_history(symbol, processed):
+                            recovered = _build_history_based_bot_trade_from_ib(
+                                context=context,
+                                ib=ib,
+                                symbol=symbol,
+                            )
 
                         if recovered:
                             def add_recovered_trade(state):
