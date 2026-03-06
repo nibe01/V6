@@ -117,7 +117,11 @@ class MultiLogger:
             logger.propagate = False  # Verhindere Parent-Propagation
 
             # Datei-Handler
-            log_dir = LOGS_DIR / category.value
+            if category == LogCategory.PERFORMANCE and self.name == "broker_monitor":
+                # Keep monitor performance snapshots separate from trader performance logs.
+                log_dir = LOGS_DIR / "monitor_performance"
+            else:
+                log_dir = LOGS_DIR / category.value
             log_dir.mkdir(parents=True, exist_ok=True)
             file_handler = DailyFileHandler(
                 log_dir=log_dir,
