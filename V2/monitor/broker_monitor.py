@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from config import validate_and_get_config
 from monitor.position_tracker import PositionTracker
@@ -82,7 +83,7 @@ def _build_monitor_state(
 
 
 def _log_monitor_performance(logger, monitor_state: dict, market_status: str) -> None:
-    """Write a compact monitor snapshot into the performance log."""
+    """Backward compatible compact snapshot helper."""
     logger.performance(
         "Monitor Snapshot | Market: %s | IB: %s | Scanner: %s | Trader: %s | "
         "Open Positions: %s | Today Trades: %s | Today P&L: $%+.2f",
@@ -94,6 +95,238 @@ def _log_monitor_performance(logger, monitor_state: dict, market_status: str) ->
         int(monitor_state.get("today_trades", 0) or 0),
         float(monitor_state.get("today_pnl_usd", 0.0) or 0.0),
     )
+
+
+def _parse_iso_utc(ts: object) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _log_monitor_performance_verbose(
+    *,
+    logger,
+    monitor_state: dict,
+    market_status: str,
+    processed: dict,
+    ib,
+    account_info,
+) -> None:
+    """Write a detailed multi-section monitor snapshot to performance logs."""
+    now_utc = datetime.now(timezone.utc)
+    today_utc = now_utc.date()
+
+    status_counts: dict[str, int] = {}
+    open_state_rows: list[dict] = []
+    closed_today_rows: list[dict] = []
+    closed_recent_rows: list[dict] = []
+
+    closed_statuses = {"closed", "manual_closed", "rejected"}
+    open_statuses = {"filled", "submitted", "manual", "presubmitted", "pendingsubmit", "pending_submit", "pending"}
+
+    for trade_data in processed.values():
+        if not isinstance(trade_data, dict):
+            continue
+
+        status = str(trade_data.get("status", "")).strip().lower() or "unknown"
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        symbol = str(trade_data.get("symbol") or "?")
+        quantity = int(trade_data.get("quantity", 0) or 0)
+        entry_price = float(
+            trade_data.get("fill_price")
+            or trade_data.get("entry_price")
+            or trade_data.get("avg_cost")
+            or 0.0
+        )
+
+        opened_at = (
+            trade_data.get("opened_at")
+            or trade_data.get("filled_at")
+            or trade_data.get("first_seen_at")
+            or trade_data.get("signal_timestamp")
+            or trade_data.get("processed_at")
+        )
+
+        if status in open_statuses:
+            open_state_rows.append(
+                {
+                    "symbol": symbol,
+                    "status": status,
+                    "quantity": quantity,
+                    "entry_price": entry_price,
+                    "opened_at": str(opened_at or ""),
+                }
+            )
+
+        if status in closed_statuses:
+            closed_at = _parse_iso_utc(
+                trade_data.get("closed_at")
+                or trade_data.get("processed_at")
+            )
+            pnl = float(trade_data.get("realized_pnl_usd", 0.0) or 0.0)
+            row = {
+                "closed_at": closed_at,
+                "symbol": symbol,
+                "status": status,
+                "quantity": quantity,
+                "entry_price": entry_price,
+                "exit_price": float(trade_data.get("exit_price", 0.0) or 0.0),
+                "pnl": pnl,
+            }
+            closed_recent_rows.append(row)
+            if closed_at is not None and closed_at.date() == today_utc:
+                closed_today_rows.append(row)
+
+    ib_open_rows: list[dict] = []
+    if ib is not None and bool(monitor_state.get("ib_connected")):
+        try:
+            for pos in ib.positions():
+                qty = int(getattr(pos, "position", 0) or 0)
+                if qty == 0:
+                    continue
+                contract = getattr(pos, "contract", None)
+                symbol = getattr(contract, "symbol", "?") if contract else "?"
+                avg_cost = float(getattr(pos, "avgCost", 0.0) or 0.0)
+                ib_open_rows.append(
+                    {
+                        "symbol": symbol,
+                        "quantity": qty,
+                        "avg_cost": avg_cost,
+                    }
+                )
+        except Exception as ib_pos_error:
+            logger.performance("IB Open Positions konnten nicht gelesen werden: %s", ib_pos_error)
+
+    closed_today_pnl = sum(float(r["pnl"]) for r in closed_today_rows)
+    total_realized = sum(float(r["pnl"]) for r in closed_recent_rows)
+
+    logger.performance("=" * 100)
+    logger.performance("MONITOR PERFORMANCE SNAPSHOT | %s", now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"))
+    logger.performance("=" * 100)
+
+    logger.performance(
+        "System | Market: %s | IB: %s | Scanner: %s | Trader: %s",
+        market_status,
+        "connected" if monitor_state.get("ib_connected") else "disconnected",
+        "running" if monitor_state.get("scanner_running") else "stopped",
+        "running" if monitor_state.get("trader_running") else "stopped",
+    )
+    logger.performance(
+        "Monitor State | Open IB Positions: %s | Today Trades: %s | Today P&L: $%+.2f",
+        int(monitor_state.get("open_positions", 0) or 0),
+        int(monitor_state.get("today_trades", 0) or 0),
+        float(monitor_state.get("today_pnl_usd", 0.0) or 0.0),
+    )
+
+    if account_info:
+        logger.performance(
+            "Account | NetLiq: $%.2f | Cash: $%.2f | BuyingPower: $%.2f",
+            float(account_info.get("net_liquidation", 0.0) or 0.0),
+            float(account_info.get("total_cash_value", 0.0) or 0.0),
+            float(account_info.get("buying_power", 0.0) or 0.0),
+        )
+
+    logger.performance("State Entries | Total: %s | Realized P&L Total: $%+.2f", sum(status_counts.values()), total_realized)
+    logger.performance(
+        "State Status Count | submitted=%s filled=%s closed=%s manual=%s manual_closed=%s rejected=%s unknown=%s",
+        status_counts.get("submitted", 0),
+        status_counts.get("filled", 0),
+        status_counts.get("closed", 0),
+        status_counts.get("manual", 0),
+        status_counts.get("manual_closed", 0),
+        status_counts.get("rejected", 0),
+        status_counts.get("unknown", 0),
+    )
+
+    logger.performance("-" * 100)
+    logger.performance("OPEN POSITIONS (IB) | Count: %s", len(ib_open_rows))
+    if ib_open_rows:
+        for row in sorted(ib_open_rows, key=lambda r: r["symbol"]):
+            logger.performance(
+                "IB Open | %s | Qty: %s | AvgCost: $%.2f",
+                row["symbol"],
+                row["quantity"],
+                row["avg_cost"],
+            )
+    else:
+        logger.performance("IB Open | none")
+
+    logger.performance("-" * 100)
+    logger.performance("OPEN POSITIONS (STATE) | Count: %s", len(open_state_rows))
+    if open_state_rows:
+        for row in sorted(open_state_rows, key=lambda r: (r["symbol"], r["status"])):
+            logger.performance(
+                "State Open | %s | Status: %s | Qty: %s | Entry: $%.2f | Opened: %s",
+                row["symbol"],
+                row["status"],
+                row["quantity"],
+                row["entry_price"],
+                row["opened_at"] or "n/a",
+            )
+    else:
+        logger.performance("State Open | none")
+
+    logger.performance("-" * 100)
+    logger.performance(
+        "CLOSED POSITIONS TODAY (STATE) | Count: %s | Realized P&L: $%+.2f",
+        len(closed_today_rows),
+        closed_today_pnl,
+    )
+    if closed_today_rows:
+        closed_today_sorted = sorted(
+            closed_today_rows,
+            key=lambda r: r["closed_at"] or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        for row in closed_today_sorted:
+            closed_at_str = row["closed_at"].strftime("%H:%M:%S") if row["closed_at"] else "n/a"
+            logger.performance(
+                "Closed Today | %s | %s | Qty: %s | Entry: $%.2f | Exit: $%.2f | P&L: $%+.2f",
+                closed_at_str,
+                row["symbol"],
+                row["quantity"],
+                row["entry_price"],
+                row["exit_price"],
+                row["pnl"],
+            )
+    else:
+        logger.performance("Closed Today | none")
+
+    logger.performance("-" * 100)
+    logger.performance("CLOSED POSITIONS RECENT (STATE) | Last 20")
+    if closed_recent_rows:
+        closed_recent_sorted = sorted(
+            closed_recent_rows,
+            key=lambda r: r["closed_at"] or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )[:20]
+        for row in closed_recent_sorted:
+            closed_at_str = (
+                row["closed_at"].strftime("%Y-%m-%d %H:%M:%S")
+                if row["closed_at"]
+                else "n/a"
+            )
+            logger.performance(
+                "Closed Recent | %s | %s | Status: %s | Qty: %s | Entry: $%.2f | Exit: $%.2f | P&L: $%+.2f",
+                closed_at_str,
+                row["symbol"],
+                row["status"],
+                row["quantity"],
+                row["entry_price"],
+                row["exit_price"],
+                row["pnl"],
+            )
+    else:
+        logger.performance("Closed Recent | none")
+
+    logger.performance("=" * 100)
 
 
 def main() -> None:
@@ -252,10 +485,29 @@ def main() -> None:
                     logger.warning("Konnte monitor_state nicht speichern")
 
                 if now_ts - last_performance_log >= PERFORMANCE_LOG_INTERVAL_SECONDS:
-                    _log_monitor_performance(
+                    account_info_dict = None
+                    if ib is not None and ib_manager.check_connection():
+                        try:
+                            acc_info = account_checker.get_account_info(ib, force_refresh=False)
+                            if acc_info:
+                                account_info_dict = {
+                                    "net_liquidation": acc_info.net_liquidation,
+                                    "buying_power": acc_info.buying_power,
+                                    "total_cash_value": acc_info.total_cash_value,
+                                }
+                        except Exception as account_snapshot_error:
+                            logger.warning(
+                                "Account-Snapshot für Performance-Log fehlgeschlagen: %s",
+                                account_snapshot_error,
+                            )
+
+                    _log_monitor_performance_verbose(
                         logger=logger,
                         monitor_state=monitor_state,
                         market_status=market_schedule.get_status_string(),
+                        processed=processed,
+                        ib=ib if ib_manager.check_connection() else None,
+                        account_info=account_info_dict,
                     )
                     last_performance_log = now_ts
 
