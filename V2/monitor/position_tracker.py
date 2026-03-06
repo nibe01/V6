@@ -8,7 +8,7 @@ from ib_insync import IB
 
 from utils.daily_loss_counter import DailyLossCounter
 from utils.symbol_cooldown import SymbolCooldownManager
-from utils.position_reconciliation import calculate_realized_pnl, resolve_exit_price
+from utils.position_reconciliation import aggregate_symbol_fills
 from utils.state_retry import save_state_with_retry
 from utils.trade_status import (
     BOT_STATUS_CLOSED,
@@ -86,6 +86,44 @@ class PositionTracker:
         """
         changed = False
 
+        # Retry closed-trade net P&L enrichment when commission reports arrive later.
+        for trade_data in processed.values():
+            if not isinstance(trade_data, dict):
+                continue
+            if trade_data.get("status") != BOT_STATUS_CLOSED:
+                continue
+            if not bool(trade_data.get("pnl_needs_commission_refresh")):
+                continue
+
+            symbol = trade_data.get("symbol")
+            if not symbol:
+                continue
+
+            opened_at = (
+                trade_data.get("opened_at")
+                or trade_data.get("filled_at")
+                or trade_data.get("signal_timestamp")
+                or trade_data.get("processed_at")
+            )
+            fill_summary = aggregate_symbol_fills(
+                ib,
+                symbol,
+                position_opened_at=opened_at,
+            )
+
+            old_net = float(trade_data.get("realized_pnl_usd", 0.0) or 0.0)
+            new_net = float(fill_summary.net_realized_pnl or 0.0)
+            if abs(old_net - new_net) > 1e-9 or bool(fill_summary.missing_commission_count == 0):
+                self._apply_fill_summary_to_trade(trade_data, fill_summary)
+                changed = True
+                self.logger.trade(
+                    "P&L REFRESH: %s | gross_pnl=$%+.2f | commissions=$%.2f | net_pnl=$%+.2f",
+                    symbol,
+                    fill_summary.gross_realized_pnl,
+                    fill_summary.commissions,
+                    fill_summary.net_realized_pnl,
+                )
+
         tracked_orders = {}
         for key, trade_data in processed.items():
             if not isinstance(trade_data, dict):
@@ -153,16 +191,19 @@ class PositionTracker:
                     )
                     continue
 
-                entry_price = trade_data.get("fill_price") or trade_data.get("entry_price", 0)
-                quantity = trade_data.get("quantity", 0)
-
-                exit_price = resolve_exit_price(
+                opened_at = (
+                    trade_data.get("opened_at")
+                    or trade_data.get("filled_at")
+                    or trade_data.get("signal_timestamp")
+                    or trade_data.get("processed_at")
+                )
+                fill_summary = aggregate_symbol_fills(
                     ib,
                     symbol,
-                    require_confirmed_exit_fill=True,
+                    position_opened_at=opened_at,
                 )
 
-                if not (exit_price and exit_price > 0):
+                if fill_summary.sell_qty <= 0:
                     # Keep trade open until we can confirm an actual exit fill from IB.
                     if (
                         missing_checks == POSITION_MISSING_CONFIRMATION_CHECKS
@@ -175,26 +216,17 @@ class PositionTracker:
                         )
                     continue
 
-                if entry_price > 0 and quantity > 0:
-                    pnl_usd, pnl_pct = calculate_realized_pnl(entry_price, exit_price, quantity)
-                    processed[key]["exit_price"] = exit_price
-                    processed[key]["realized_pnl_usd"] = pnl_usd
-                    processed[key]["realized_pnl_pct"] = pnl_pct
-                    self.logger.trade(
-                        "EXIT: %s | Entry: $%.2f -> Exit: $%.2f | P&L: $%+.2f (%+.2f%%) | Qty: %s",
-                        symbol,
-                        entry_price,
-                        exit_price,
-                        pnl_usd,
-                        pnl_pct,
-                        quantity,
-                    )
-                else:
-                    self.logger.trade(
-                        "EXIT: %s | Exit: $%.2f | P&L not available (missing entry/qty)",
-                        symbol,
-                        exit_price,
-                    )
+                self._apply_fill_summary_to_trade(processed[key], fill_summary)
+                self.logger.trade(
+                    "EXIT: %s | sold_qty=%s | remaining_qty=%s | gross_pnl=$%+.2f | "
+                    "commissions=$%.2f | net_pnl=$%+.2f",
+                    symbol,
+                    fill_summary.sell_qty,
+                    fill_summary.remaining_qty,
+                    fill_summary.gross_realized_pnl,
+                    fill_summary.commissions,
+                    fill_summary.net_realized_pnl,
+                )
 
                 processed[key]["status"] = BOT_STATUS_CLOSED
                 processed[key]["closed_at"] = datetime.now(timezone.utc).isoformat()
@@ -211,6 +243,31 @@ class PositionTracker:
                 max_retries=3,
                 retry_delay=0.5,
             )
+
+    def _apply_fill_summary_to_trade(self, trade_data: dict, fill_summary) -> None:
+        """Project normalized fill summary fields to a trade state row."""
+        entry_price = float(
+            trade_data.get("fill_price")
+            or trade_data.get("entry_price")
+            or 0.0
+        )
+        matched_qty = int(fill_summary.matched_qty or 0)
+        net_pnl = float(fill_summary.net_realized_pnl or 0.0)
+
+        trade_data["exit_price"] = float(fill_summary.avg_sell_price or trade_data.get("exit_price") or 0.0)
+        trade_data["sold_quantity"] = int(fill_summary.sell_qty or 0)
+        trade_data["remaining_quantity"] = int(fill_summary.remaining_qty or 0)
+        trade_data["realized_pnl_gross_usd"] = float(fill_summary.gross_realized_pnl or 0.0)
+        trade_data["realized_pnl_commission_usd"] = float(fill_summary.commissions or 0.0)
+        trade_data["realized_pnl_usd"] = net_pnl
+        trade_data["realized_pnl_net_usd"] = net_pnl
+        trade_data["realized_pnl_source"] = "ib_fills_net"
+        trade_data["pnl_needs_commission_refresh"] = bool(
+            fill_summary.missing_commission_count > 0
+        )
+
+        if matched_qty > 0 and entry_price > 0:
+            trade_data["realized_pnl_pct"] = (net_pnl / (entry_price * matched_qty)) * 100.0
 
     def generate_daily_report(self, processed: dict) -> str:
         today = datetime.now(timezone.utc).date()
@@ -246,7 +303,7 @@ class PositionTracker:
             "EOD Report | "
             f"Trades: {trade_count} | "
             f"Win Rate: {win_rate:.1f}% | "
-            f"Total P&L: ${total_pnl:+.2f} | "
-            f"Best: ${best_trade:+.2f} | "
-            f"Worst: ${worst_trade:+.2f}"
+            f"Total Net P&L: ${total_pnl:+.2f} | "
+            f"Best Net: ${best_trade:+.2f} | "
+            f"Worst Net: ${worst_trade:+.2f}"
         )
