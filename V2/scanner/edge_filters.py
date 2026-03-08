@@ -185,7 +185,9 @@ def filter_volume_activity(bars_df: pd.DataFrame, config) -> Dict[str, Any]:
     dollar_volume_series = volume_series * close_series
 
     # Calculate RVOL using robust hybrid method
-    rvol = calculate_rvol(bars_df, lookback_days=10)
+    rvol_raw = calculate_rvol(bars_df, lookback_days=10)
+    rvol_available = rvol_raw is not None
+    rvol = float(rvol_raw) if rvol_available else 0.0
 
     # Check volume acceleration (last 3 bars increasing)
     last_3_volumes = volume_series.tail(3).values
@@ -213,7 +215,8 @@ def filter_volume_activity(bars_df: pd.DataFrame, config) -> Dict[str, Any]:
     min_last_5m_dollar_volume = float(getattr(config, 'min_last_5m_dollar_volume', 25000.0))
     require_volume_acceleration = bool(getattr(config, 'require_volume_acceleration', False))
 
-    rvol_pass = rvol >= min_rvol
+    # If RVOL cannot be computed, skip RVOL check instead of hard-failing.
+    rvol_pass = (not rvol_available) or (rvol >= min_rvol)
     median_vol_pass = median_5m_volume >= min_median_5m_volume
     avg_dollar_pass = avg_5m_dollar_volume >= min_avg_5m_dollar_volume
     last_dollar_pass = last_5m_dollar_volume >= min_last_5m_dollar_volume
@@ -229,7 +232,7 @@ def filter_volume_activity(bars_df: pd.DataFrame, config) -> Dict[str, Any]:
 
     failure_reasons = []
     if not rvol_pass:
-        failure_reasons.append('low_rvol')
+        failure_reasons.append(f'low_rvol({rvol:.2f}<{min_rvol})')
     if not median_vol_pass:
         failure_reasons.append('low_median_5m_volume')
     if not avg_dollar_pass:
@@ -240,11 +243,14 @@ def filter_volume_activity(bars_df: pd.DataFrame, config) -> Dict[str, Any]:
         failure_reasons.append('volume_not_accelerating')
 
     reason = 'passed' if passed else '|'.join(failure_reasons)
+    if not rvol_available:
+        reason = f"{reason}|rvol_unavailable_skipped"
     
     return {
         'passed': passed,
         'metrics': {
             'rvol': rvol,
+            'rvol_available': rvol_available,
             'vol_accelerating': vol_accelerating,
             'median_5m_volume': median_5m_volume,
             'avg_5m_dollar_volume': avg_5m_dollar_volume,

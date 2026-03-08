@@ -75,7 +75,7 @@ def calculate_vwap(bars_df: pd.DataFrame) -> float:
     return vwap
 
 
-def calculate_rvol(bars_df: pd.DataFrame, lookback_days: int = 10) -> float:
+def calculate_rvol(bars_df: pd.DataFrame, lookback_days: int = 10) -> Optional[float]:
     """
     Calculate Relative Volume using HYBRID approach with multiple fallback methods.
 
@@ -189,7 +189,7 @@ def calculate_rvol(bars_df: pd.DataFrame, lookback_days: int = 10) -> float:
     try:
         daily_rvol = calculate_daily_rvol(bars_df, lookback_days)
 
-        if daily_rvol != 1.0:
+        if daily_rvol > 0:
             logger.debug(f"RVOL Method 4 (Daily): {daily_rvol:.2f}")
             return float(daily_rvol)
 
@@ -217,8 +217,8 @@ def calculate_rvol(bars_df: pd.DataFrame, lookback_days: int = 10) -> float:
     except Exception as e:
         logger.debug(f"RVOL Method 5 failed: {e}")
 
-    logger.debug("RVOL: All methods failed, returning fallback 1.0")
-    return 1.0
+    logger.warning("RVOL: All methods failed, no historical data available - returning None")
+    return None
 
 
 def calculate_daily_rvol(bars_df: pd.DataFrame, lookback_days: int = 10) -> float:

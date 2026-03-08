@@ -66,7 +66,7 @@ class StrategyConfig:
     rule_operator: RuleOp = "ALL"
     rules: List[RuleConfig] = None
     bar_size: str = "1 min"  # Historical bar granularity.
-    duration: str = "5 D"  # Historical lookback window requested from IB.
+    duration: str = "10 D"  # Erhöht für zuverlässige RVOL-Berechnung (mind. 5 Handelstage nötig)
     what_to_show: str = "TRADES"  # IB data source: TRADES/MIDPOINT/BID/ASK/...
 
 
